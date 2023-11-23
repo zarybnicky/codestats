@@ -23,6 +23,8 @@
             pkgs.pgformatter
           ];
 
+          processes.migrate.exec = "sleep 1 && graphile-migrate watch";
+
           services.postgres = {
             enable = true;
             package = pkgs.postgresql_15;

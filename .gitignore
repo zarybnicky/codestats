@@ -6,3 +6,4 @@ tmp/
 result
 .direnv
 .devenv
+__pycache__/
