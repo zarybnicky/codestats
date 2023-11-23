@@ -49,8 +49,7 @@
    * afterReset: actions executed after a `graphile-migrate reset` command.
    */
   "afterReset": [
-    // "!roles_extensions.sql",
-    // "!initial_schema.sql",
+    "!initial_schema.sql",
     // { "_": "command", "command": "cd backend/ && yarn worker-schema" },
   ],
 
