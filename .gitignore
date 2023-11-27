@@ -8,3 +8,4 @@ result
 .devenv
 __pycache__/
 node_modules/
+.env.local
