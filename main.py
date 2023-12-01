@@ -46,7 +46,6 @@ with conn.session as sess:
     sess.commit()
 
 
-
 def get_repo_paths(provider, repo):
     settings = provider['settings']
     root = Path(settings['root'])
@@ -212,8 +211,9 @@ def fetch_commits(provider, repo_object):
 
 def select_provider() -> Provider:
     providers = conn.query('select * from mergestat.providers', ttl=3600)
-    provider_name = st.selectbox("Provider", options=providers['name'])
-    return providers[providers['name'] == provider_name].iloc[0]
+    provider_name = st.selectbox("Forge", options=providers['name'], index=None)
+    selected = providers[providers['name'] == provider_name]
+    return None if selected.empty else selected.iloc[0]
 
 
 def select_repo(provider) -> str:
@@ -288,15 +288,16 @@ def main():
         status.update(label=f"Extracted {done} repos", state="complete", expanded=False)
 
     provider = select_provider()
-    repo_pattern = st.text_input('Repository (SQL-like, with % as *)', '') or "%"
-    author_pattern = st.text_input('Author e-mail (SQL-like, with % as *)', '') or "%"
+    p_provider = provider['id'] if provider is not None and not provider.empty else None
+    p_repo = st.text_input('Repository (SQL-like, with % as *)', '') or "%"
+    p_author = st.text_input('Author e-mail (SQL-like, with % as *)', '') or "%"
 
     last_active = conn.query("""
     select repo, message, author_when, author_name, author_email
     from repos join git_commits on repo_id=repos.id
-    where provider = :id and repo like :p_repo and author_email like :p_author
+    where case when :id is null then true else provider = :id end and repo like :p_repo and author_email like :p_author
     order by author_when desc limit 100
-    """, params={'id': provider['id'], 'p_repo': repo_pattern, 'p_author': author_pattern}, ttl=0)
+    """, params={'id': p_provider, 'p_repo': p_repo, 'p_author': p_author}, ttl=0)
     last_active.set_index(keys=['author_when'], drop=True, inplace=True)
     st.markdown("### Last commit activity")
     st.write(last_active)
@@ -306,40 +307,40 @@ def main():
         most_active = conn.query("""
         select repos.repo, count(hash)
         from repos join git_commits on repo_id=repos.id
-        where provider = :id and repo like :p_repo and author_email like :p_author
+        where case when :id is null then true else provider = :id end and repo like :p_repo and author_email like :p_author
         group by repos.repo order by count(hash) desc limit 100
-        """, params={'id': provider['id'], 'p_repo': repo_pattern, 'p_author': author_pattern}, ttl=0)
+        """, params={'id': p_provider, 'p_repo': p_repo, 'p_author': p_author}, ttl=0)
         st.markdown("### Most active repositories")
         st.write(most_active)
     with col2:
         authors = conn.query("""
         select author_email, count(hash)
         from repos join git_commits on repo_id=repos.id
-        where provider = :id and repo like :p_repo and author_email like :p_author
+        where case when :id is null then true else provider = :id end and repo like :p_repo and author_email like :p_author
         group by author_email order by count(hash) desc limit 100
-        """, params={'id': provider['id'], 'p_repo': repo_pattern, 'p_author': author_pattern}, ttl=0)
+        """, params={'id': p_provider, 'p_repo': p_repo, 'p_author': p_author}, ttl=0)
         st.markdown("### Most active authors")
         st.write(authors)
     with col3:
         authors = conn.query("""
         select committer_email, count(hash)
         from repos join git_commits on repo_id=repos.id
-        where provider = :id and repo like :p_repo and author_email like :p_author
+        where case when :id is null then true else provider = :id end and repo like :p_repo and author_email like :p_author
         group by committer_email order by count(hash) desc limit 100
-        """, params={'id': provider['id'], 'p_repo': repo_pattern, 'p_author': author_pattern}, ttl=0)
+        """, params={'id': p_provider, 'p_repo': p_repo, 'p_author': p_author}, ttl=0)
         st.markdown("### Most active committers")
         st.write(authors)
 
     st.markdown("### Commit count timeline")
     granularity = st.selectbox("Graph granularity", options=['month', 'week', 'day']) or 'week'
     per_period = conn.query("""
-    select date_trunc(:granularity, author_when) as author_when, count(hash)
+    select date_trunc(:granularity, author_when) as author_when, provider, count(hash)
     from repos join git_commits on repo_id=repos.id
-    where provider = :id and repo like :p_repo and author_email like :p_author
-    group by date_trunc(:granularity, author_when) order by author_when desc
-    """, params={'id': provider['id'], 'p_repo': repo_pattern, 'p_author': author_pattern, 'granularity': granularity}, ttl=0)
+    where case when :id is null then true else provider = :id end and repo like :p_repo and author_email like :p_author
+    group by date_trunc(:granularity, author_when), provider order by author_when desc
+    """, params={'id': p_provider, 'p_repo': p_repo, 'p_author': p_author, 'granularity': granularity}, ttl=0)
     per_period.set_index(keys=['author_when'], drop=True, inplace=True)
-    st.bar_chart(per_period)
+    st.bar_chart(per_period, color='provider', y='count')
 
 
 if __name__ == '__main__':
