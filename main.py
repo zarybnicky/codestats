@@ -275,7 +275,7 @@ def select_provider(conn):
 
 
 def select_repo(conn, provider) -> str | None:
-    df = conn.query("select id, repo, settings->>'root' as root from repos where provider = :id", params={'id': provider['id']}, ttl=0)
+    df = conn.query("select id, repo, settings->>'root' as root from repos where provider = :id", params={'id': provider['id']}, ttl=3600)
     st.write(f"Total: {len(df)} repos")
 
     repo_ix = st.selectbox("Repo", options=df.index, format_func=lambda x: df.loc[x]['repo'])
@@ -398,7 +398,7 @@ def main():
     from repos join git_commits on repo_id=repos.id
     where not is_duplicate and case when :id is null then true else provider = :id end and repo like :p_repo and author_name like :p_name and author_email like :p_email
     order by author_when desc limit 100
-    """, params={'id': p_provider, 'p_repo': p_repo, 'p_name': p_name, 'p_email': p_email}, ttl=0)
+    """, params={'id': p_provider, 'p_repo': p_repo, 'p_name': p_name, 'p_email': p_email}, ttl=3600)
     last_active.set_index(keys=['author_when'], drop=True, inplace=True)
     st.markdown("### Last commit activity")
     st.write(last_active)
@@ -410,7 +410,7 @@ def main():
         from repos join git_commits on repo_id=repos.id
         where not is_duplicate and case when :id is null then true else provider = :id end and repo like :p_repo and author_name like :p_name and author_email like :p_email
         group by repos.repo order by count(hash) desc limit 100
-        """, params={'id': p_provider, 'p_repo': p_repo, 'p_name': p_name, 'p_email': p_email}, ttl=0)
+        """, params={'id': p_provider, 'p_repo': p_repo, 'p_name': p_name, 'p_email': p_email}, ttl=3600)
         st.markdown("### Most active repositories")
         st.write(most_active)
     with col2:
@@ -419,7 +419,7 @@ def main():
         from repos join git_commits on repo_id=repos.id
         where not is_duplicate and case when :id is null then true else provider = :id end and repo like :p_repo and author_name like :p_name and author_email like :p_email
         group by author_email order by count(hash) desc limit 100
-        """, params={'id': p_provider, 'p_repo': p_repo, 'p_name': p_name, 'p_email': p_email}, ttl=0)
+        """, params={'id': p_provider, 'p_repo': p_repo, 'p_name': p_name, 'p_email': p_email}, ttl=3600)
         st.markdown("### Most active authors")
         st.write(authors)
     with col3:
@@ -428,7 +428,7 @@ def main():
         from repos join git_commits on repo_id=repos.id
         where not is_duplicate and case when :id is null then true else provider = :id end and repo like :p_repo and author_name like :p_name and author_email like :p_email
         group by committer_email order by count(hash) desc limit 100
-        """, params={'id': p_provider, 'p_repo': p_repo, 'p_name': p_name, 'p_email': p_email}, ttl=0)
+        """, params={'id': p_provider, 'p_repo': p_repo, 'p_name': p_name, 'p_email': p_email}, ttl=3600)
         st.markdown("### Most active committers")
         st.write(authors)
 
@@ -439,7 +439,7 @@ def main():
     from repos join git_commits on repo_id=repos.id join mergestat.providers on provider=providers.id
     where not is_duplicate and case when :id is null then true else provider = :id end and repo like :p_repo and author_name like :p_name and author_email like :p_email
     group by date_trunc(:granularity, author_when), providers.name order by author_when desc, providers.name desc
-    """, params={'id': p_provider, 'p_repo': p_repo, 'p_name': p_name, 'p_email': p_email, 'granularity': granularity}, ttl=0)
+    """, params={'id': p_provider, 'p_repo': p_repo, 'p_name': p_name, 'p_email': p_email, 'granularity': granularity}, ttl=3600)
     per_period.set_index(keys=['author_when'], drop=True, inplace=True)
     st.bar_chart(per_period, color='provider', y='count')
 
@@ -449,7 +449,7 @@ def main():
     # from repos join git_commits on repo_id=repos.id join git_commit_stats s on hash=s.commit_hash
     # where not is_duplicate and case when :id is null then true else provider = :id end and repo like :p_repo and author_name like :p_name and author_email like :p_email
     # group by file_path, repo order by count(*) desc limit 100
-    # """, params={'id': p_provider, 'p_repo': p_repo, 'p_name': p_name, 'p_email': p_email}, ttl=0)
+    # """, params={'id': p_provider, 'p_repo': p_repo, 'p_name': p_name, 'p_email': p_email}, ttl=3600)
     # st.write(files)
 
     st.markdown("### Lines added/removed timeline")
@@ -458,7 +458,7 @@ def main():
     from repos join git_commits on repo_id=repos.id join git_commit_stats s on hash=s.commit_hash
     where not is_duplicate and case when :id is null then true else provider = :id end and repo like :p_repo and author_name like :p_name and author_email like :p_email
     group by date_trunc(:granularity, author_when), provider order by author_when desc
-    """, params={'id': p_provider, 'p_repo': p_repo, 'p_name': p_name, 'p_email': p_email, 'granularity': granularity}, ttl=0)
+    """, params={'id': p_provider, 'p_repo': p_repo, 'p_name': p_name, 'p_email': p_email, 'granularity': granularity}, ttl=3600)
     per_period.set_index(keys=['author_when'], drop=True, inplace=True)
     st.bar_chart(per_period, y=['added', 'deleted'])
 
@@ -468,24 +468,28 @@ def main():
     from repos join git_commits on repo_id=repos.id
     where not is_duplicate and case when :id is null then true else provider = :id end and repo like :p_repo and author_name like :p_name and author_email like :p_email
     group by date_trunc('day', author_when) order by date desc
-    """, params={'id': p_provider, 'p_repo': p_repo, 'p_name': p_name, 'p_email': p_email, 'granularity': granularity}, ttl=0)
+    """, params={'id': p_provider, 'p_repo': p_repo, 'p_name': p_name, 'p_email': p_email, 'granularity': granularity}, ttl=3600)
     per_period.set_index(keys=['date'], drop=False, inplace=True)
 
+
     years = per_period['date'].dt.year
-    year_range = range(years.max(), max(2010, years.min()) - 1, -1)
+    year_range = range(years.max(), years.min() - 1, -1)
     tabs = st.tabs([str(year) for year in year_range])
     for idx, year in enumerate(year_range):
         with tabs[idx]:
-            # per_year = per_period[years == year]['count'].resample('D').sum().reset_index()
-            per_year = per_period[years == year]['count'].reindex(
+            per_year = per_period[years == year]['count']
+            scale_max = per_year.quantile(.95)
+            scale = alt.Scale(domain=[1, scale_max])
+            per_year = per_year.reindex(
                 pd.date_range(f'01-01-{year}', f'12-31-{year}', tz='UTC', name='date'),
                 fill_value=0
             ).reset_index()
 
             chart = alt.Chart(per_year, title=f"Activity chart for year {year}").mark_rect().encode(
                 alt.X("week(date):O").title("Month"),
-                alt.Y('date:T', timeUnit='day', type='ordinal', sort=['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday']).title("Day"),
-                alt.Color("count:Q", scale=alt.Scale(domain=[1, 30])).title(None),
+                alt.Y('day(date):O').title("Day"),
+                # alt.Y('date:T', timeUnit='day', type='ordinal', sort=['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday']).title("Day"),
+                alt.Color("count:Q", scale=scale).title(None),
                 tooltip=[
                     alt.Tooltip("monthdate(date)", title="Date"),
                     alt.Tooltip("count:Q", title="Commits"),
