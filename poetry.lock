@@ -26,18 +26,6 @@ dev = ["anywidget", "black (<24)", "hatch", "ipython", "m2r", "mypy", "pandas-st
 doc = ["docutils", "geopandas", "jinja2", "myst-parser", "numpydoc", "pillow (>=9,<10)", "pydata-sphinx-theme", "scipy", "sphinx", "sphinx-copybutton", "sphinx-design", "sphinxext-altair"]
 
 [[package]]
-name = "async-timeout"
-version = "4.0.3"
-description = "Timeout context manager for asyncio programs"
-category = "main"
-optional = false
-python-versions = ">=3.7"
-files = [
-    {file = "async-timeout-4.0.3.tar.gz", hash = "sha256:4640d96be84d82d02ed59ea2b7105a0f7b33abe8703703cd0ab0bf87c427522f"},
-    {file = "async_timeout-4.0.3-py3-none-any.whl", hash = "sha256:7405140ff1230c310e51dc27b3145b9092d659ce68ff733fb0cefe3ee42be028"},
-]
-
-[[package]]
 name = "attrs"
 version = "23.1.0"
 description = "Classes Without Boilerplate"
@@ -218,32 +206,6 @@ files = [
     {file = "colorama-0.4.6-py2.py3-none-any.whl", hash = "sha256:4f1d9991f5acc0ca119f9d443620b77f9d6b33703e51011c16baf57afb285fc6"},
     {file = "colorama-0.4.6.tar.gz", hash = "sha256:08695f5cb7ed6e0531a20572697297273c47b8cae5a63ffc6d6ed5c201be6e44"},
 ]
-
-[[package]]
-name = "git-pandas"
-version = "2.0.0"
-description = ""
-category = "main"
-optional = false
-python-versions = "*"
-files = []
-develop = false
-
-[package.dependencies]
-gitpython = ">=1.0.0"
-numpy = ">=1.9.0"
-pandas = ">=0.16.0"
-redis = "*"
-requests = "*"
-
-[package.extras]
-examples = ["lifelines", "matplotlib"]
-
-[package.source]
-type = "git"
-url = "https://github.com/wdm0006/git-pandas"
-reference = "HEAD"
-resolved_reference = "2b25a3e3b02f711ea4a0b57a4ebebd1fd38fdebd"
 
 [[package]]
 name = "gitdb"
@@ -895,25 +857,6 @@ files = [
 ]
 
 [[package]]
-name = "redis"
-version = "5.0.1"
-description = "Python client for Redis database and key-value store"
-category = "main"
-optional = false
-python-versions = ">=3.7"
-files = [
-    {file = "redis-5.0.1-py3-none-any.whl", hash = "sha256:ed4802971884ae19d640775ba3b03aa2e7bd5e8fb8dfaed2decce4d0fc48391f"},
-    {file = "redis-5.0.1.tar.gz", hash = "sha256:0dab495cd5753069d3bc650a0dde8a8f9edde16fc5691b689a566eda58100d0f"},
-]
-
-[package.dependencies]
-async-timeout = {version = ">=4.0.2", markers = "python_full_version <= \"3.11.2\""}
-
-[package.extras]
-hiredis = ["hiredis (>=1.0.0)"]
-ocsp = ["cryptography (>=36.0.1)", "pyopenssl (==20.0.1)", "requests (>=2.26.0)"]
-
-[[package]]
 name = "referencing"
 version = "0.31.0"
 description = "JSON Referencing + Python"
@@ -1432,4 +1375,4 @@ testing = ["big-O", "jaraco.functools", "jaraco.itertools", "more-itertools", "p
 [metadata]
 lock-version = "2.0"
 python-versions = "^3.10"
-content-hash = "3aa99cfa5bfa84885c276d33d26fce7de525382b1855335d48e90e02ee829e12"
+content-hash = "b816f7f5d16b1c766462a3ce1944000a336329b33161e5f1ca33080e141014f8"
