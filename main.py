@@ -153,13 +153,16 @@ def index_current_files(repo_object):
     files = []
     for f in repo.head.commit.tree.list_traverse():
         if f.type == 'blob':
+            path = str(f.path).encode('utf-8','ignore').decode("utf-8")
+            ext = os.path.splitext(path)[1] or os.path.basename(path)
             files.append([
                 repo_object['id'],
-                str(f.path).encode('utf-8','ignore').decode("utf-8"),
+                path,
                 f.file_mode & 0o100,
                 f.size,
+                ext,
             ])
-    df = pd.DataFrame(files, columns=['repo_id', 'path', 'executable', 'size']);
+    df = pd.DataFrame(files, columns=['repo_id', 'path', 'executable', 'size', 'ext']);
 
     with conn.engine.begin() as conn2:
         cursor = conn2.connection.cursor()
@@ -168,7 +171,7 @@ def index_current_files(repo_object):
         df.to_csv(s_buf, sep="\t", index=False, header=False, date_format='%Y-%m-%dT%H:%M:%S')
         s_buf.seek(0)
         cursor.execute("CREATE TEMP TABLE tmp_table (LIKE git_files INCLUDING DEFAULTS) on commit drop")
-        cursor.copy_expert("COPY tmp_table (repo_id, path, executable, size) FROM STDIN (FORMAT CSV, delimiter E'\\t')", s_buf)
+        cursor.copy_expert("COPY tmp_table (repo_id, path, executable, size, ext) FROM STDIN (FORMAT CSV, delimiter E'\\t')", s_buf)
         cursor.execute("DELETE FROM git_files where repo_id = (select repo_id from tmp_table limit 1)")
         cursor.execute("INSERT INTO git_files SELECT * FROM tmp_table ON CONFLICT DO NOTHING RETURNING 1")
         inserted = cursor.fetchall()
@@ -365,7 +368,7 @@ def main():
         and repo ~* :p_repo and repo !~* :p_negrepo
         and (author_name ~* :p_author or author_email ~* :p_author)
         and (author_name !~* :p_negauthor and author_email !~* :p_negauthor)
-        and author_when between :from and :to
+        and author_when between :from and date_trunc('month', :to + interval '31 day')
         """
         params = {
             'id': p_provider,
@@ -431,35 +434,37 @@ def main():
             left join lateral (select count(*) as commit_count from git_commits where repo_id=repos.id) t1 on true
             group by first_rev, commit_count
             having count(first_rev) > 1
+            ), reverted as (
+              update repos set is_duplicate = false
             ) update repos set is_duplicate = true where repo in (select dup from exact_mirrors)
             """)
             sess.commit()
 
+    st.markdown("### Last commit activity")
     last_active = conn.query(f"""
     select repo, message, author_when, author_name, author_email
     from repos join git_commits on repo_id=repos.id
     {basic_filter} order by author_when desc limit 100
     """, params=params, ttl=3600)
     last_active.set_index(keys=['author_when'], drop=True, inplace=True)
-    st.markdown("### Last commit activity")
     st.write(last_active)
 
     col1, col2, col3 = st.columns([3, 2, 4])
     with col1:
+        st.markdown("### Most active repositories")
         most_active = conn.query(f"""
         select repos.repo, count(*) as commits
         from repos join git_commits on repo_id=repos.id
         {basic_filter} group by repos.repo order by count(hash) desc limit 100
         """, params=params, ttl=3600)
-        st.markdown("### Most active repositories")
         st.dataframe(most_active, hide_index=True)
     with col2:
+        st.markdown("### Most active authors")
         authors = conn.query(f"""
         select author_email, count(*) as commits
         from repos join git_commits on repo_id=repos.id
         {basic_filter} group by author_email order by count(hash) desc limit 100
         """, params=params, ttl=3600)
-        st.markdown("### Most active authors")
         st.dataframe(authors, hide_index=True)
     with col3:
         st.markdown("### Most active files")
@@ -487,7 +492,6 @@ def main():
     """, params=params, ttl=3600)
     per_period.set_index(keys=['author_when'], drop=True, inplace=True)
     st.bar_chart(per_period, y=['added', 'deleted'])
-
 
     st.markdown("### Activity chart (GitHub contribution graph)")
     per_period = conn.query(f"""
@@ -541,6 +545,96 @@ def main():
         tooltip=['repo:N', 'commits:Q', 'files:Q', 'last_touched:T'],
     )
     st.altair_chart(c, use_container_width=True)
+
+    st.markdown("### Technologies")
+    most_active = conn.query(f"""
+    with techs as (
+    select path, ext,
+    case ext
+    when 'Dockerfile' then 'Docker'
+    when '.js' then 'JavaScript'
+    when '.ts' then 'TypeScript'
+    when '.tsx' then 'TypeScript'
+    when '.vue' then 'TypeScript'
+    when '.tf' then 'Terraform'
+    when '.rb' then 'Ruby'
+    when '.erb' then 'Ruby'
+    when '.pp' then 'Puppet'
+    when '.go' then 'Go'
+    when '.py' then 'Python'
+    when '.java' then 'Java-like'
+    when '.groovy' then 'Java-like'
+    when '.pyc' then 'Artifact'
+    when '.map' then 'Artifact'
+    when '.ico' then 'Image'
+    when '.JPG' then 'Image'
+    when '.jpg' then 'Image'
+    when '.webp' then 'Image'
+    when '.svg' then 'Image'
+    when '.gif' then 'Image'
+    when '.png' then 'Image'
+    when '.module' then 'Drupal'
+    when '.info' then 'Drupal'
+    when '.test' then 'Drupal'
+    when '.install' then 'Drupal'
+    when '.php' then 'PHP'
+    when '.inc' then 'PHP template'
+    when '.tpl' then 'PHP template'
+    when '.phpt' then 'PHP template'
+    when '.twig' then 'PHP template'
+    when '.html' then 'HTML'
+    when '.htm' then 'HTML'
+    when '.xhtml' then 'HTML'
+    when '.css' then 'CSS'
+    when '.scss' then 'CSS'
+    when '.less' then 'CSS'
+    when '.markdown' then 'Document'
+    when '.md' then 'Document'
+    when '.pdf' then 'Document'
+    when '.PDF' then 'Document'
+    when '.rst' then 'Document'
+    when '.txt' then 'Document'
+    when '.xml' then 'Configuration'
+    when '.yml' then 'Configuration'
+    when '.yaml' then 'Configuration'
+    when '.json' then 'Configuration'
+    when '.conf' then 'Configuration'
+    when '.sh' then 'Shell script'
+    when '.gitignore' then null
+    when 'LICENSE' then null
+    else null end as tech
+    from git_files
+    ) select tech, count(*)
+    from techs
+    where tech is not null and tech <> 'Image' and tech <> 'Text' and tech <> 'Artifact'
+    group by tech
+    having count(*) > 2000
+    order by count(*) desc limit 100
+    """, params=params, ttl=3600)
+
+    col1, col2 = st.columns(2)
+    with col1:
+        c = alt.Chart(most_active).mark_arc(innerRadius=50).encode(
+            theta=alt.Theta("count:Q"),
+            color=alt.Color("tech:N").sort(field='count:Q').scale(scheme="category20"),
+            order="count:Q",
+        )
+        st.altair_chart(c)
+
+    with col2:
+        most_active = conn.query("""
+        select ext as tech, count(*)
+        from git_files
+        group by ext
+        order by count(*) desc limit 20
+        """, params=params, ttl=3600)
+        c = alt.Chart(most_active).mark_arc(innerRadius=50).encode(
+            theta=alt.Theta("count:Q"),
+            color=alt.Color("tech:N").sort(field='count:Q').scale(scheme="category20"),
+            order="count:Q",
+        )
+        st.altair_chart(c)
+
 
 if __name__ == '__main__':
     main()
