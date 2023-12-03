@@ -6,7 +6,8 @@ CREATE TABLE public.repos (
     settings jsonb DEFAULT jsonb_build_object() NOT NULL,
     tags jsonb DEFAULT jsonb_build_array() NOT NULL,
     repo_import_id uuid,
-    provider uuid NOT NULL
+    provider uuid NOT NULL,
+    is_duplicate boolean DEFAULT false NOT NULL
 );
 
 COMMENT ON TABLE public.repos IS 'git repositories to track';
@@ -34,4 +35,5 @@ ALTER TABLE ONLY public.repos
     ADD CONSTRAINT repos_repo_import_id_fkey FOREIGN KEY (repo_import_id) REFERENCES mergestat.repo_imports(id) ON UPDATE RESTRICT ON DELETE CASCADE;
 
 CREATE INDEX idx_repos_repo_import_id_fkey ON public.repos USING btree (repo_import_id);
+CREATE INDEX repos_is_duplicate ON public.repos USING btree (is_duplicate);
 CREATE UNIQUE INDEX repos_repo_ref_unique ON public.repos USING btree (repo, ((ref IS NULL))) WHERE (ref IS NULL);

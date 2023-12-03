@@ -5,8 +5,8 @@ CREATE TABLE public.git_commit_stats (
     additions integer NOT NULL,
     deletions integer NOT NULL,
     _mergestat_synced_at timestamp with time zone DEFAULT now() NOT NULL,
-    old_file_mode text DEFAULT 'unknown'::text NOT NULL,
-    new_file_mode text DEFAULT 'unknown'::text NOT NULL
+    old_file_mode text,
+    new_file_mode text
 );
 
 COMMENT ON TABLE public.git_commit_stats IS 'git commit stats of a repo';
@@ -28,7 +28,7 @@ GRANT SELECT ON TABLE public.git_commit_stats TO mergestat_role_demo;
 GRANT SELECT ON TABLE public.git_commit_stats TO mergestat_role_queries_only;
 
 ALTER TABLE ONLY public.git_commit_stats
-    ADD CONSTRAINT commit_stats_pkey PRIMARY KEY (repo_id, file_path, commit_hash, new_file_mode);
+    ADD CONSTRAINT commit_stats_pkey PRIMARY KEY (repo_id, file_path, commit_hash);
 ALTER TABLE ONLY public.git_commit_stats
     ADD CONSTRAINT git_commit_stats_repo_id_fkey FOREIGN KEY (repo_id) REFERENCES public.repos(id) ON UPDATE RESTRICT ON DELETE CASCADE;
 

@@ -9,7 +9,9 @@ CREATE TABLE public.git_commits (
     committer_email text,
     committer_when timestamp with time zone NOT NULL,
     parents integer NOT NULL,
-    _mergestat_synced_at timestamp with time zone DEFAULT now() NOT NULL
+    _mergestat_synced_at timestamp with time zone DEFAULT now() NOT NULL,
+    additions integer,
+    deletions integer
 );
 
 COMMENT ON TABLE public.git_commits IS 'git commit history of a repo';

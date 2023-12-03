@@ -24,6 +24,20 @@ CREATE SCHEMA mergestat;
 
 
 --
+-- Name: public; Type: SCHEMA; Schema: -; Owner: -
+--
+
+-- *not* creating schema, since initdb creates it
+
+
+--
+-- Name: SCHEMA public; Type: COMMENT; Schema: -; Owner: -
+--
+
+COMMENT ON SCHEMA public IS '';
+
+
+--
 -- Name: sqlq; Type: SCHEMA; Schema: -; Owner: -
 --
 
@@ -997,7 +1011,8 @@ CREATE TABLE public.repos (
     settings jsonb DEFAULT jsonb_build_object() NOT NULL,
     tags jsonb DEFAULT jsonb_build_array() NOT NULL,
     repo_import_id uuid,
-    provider uuid NOT NULL
+    provider uuid NOT NULL,
+    is_duplicate boolean DEFAULT false NOT NULL
 );
 
 
@@ -2019,8 +2034,8 @@ CREATE TABLE public.git_commit_stats (
     additions integer NOT NULL,
     deletions integer NOT NULL,
     _mergestat_synced_at timestamp with time zone DEFAULT now() NOT NULL,
-    old_file_mode text DEFAULT 'unknown'::text NOT NULL,
-    new_file_mode text DEFAULT 'unknown'::text NOT NULL
+    old_file_mode text,
+    new_file_mode text
 );
 
 
@@ -2102,7 +2117,9 @@ CREATE TABLE public.git_commits (
     committer_email text,
     committer_when timestamp with time zone NOT NULL,
     parents integer NOT NULL,
-    _mergestat_synced_at timestamp with time zone DEFAULT now() NOT NULL
+    _mergestat_synced_at timestamp with time zone DEFAULT now() NOT NULL,
+    additions integer,
+    deletions integer
 );
 
 
@@ -2631,7 +2648,7 @@ ALTER TABLE ONLY public._mergestat_explore_repo_metadata
 --
 
 ALTER TABLE ONLY public.git_commit_stats
-    ADD CONSTRAINT commit_stats_pkey PRIMARY KEY (repo_id, file_path, commit_hash, new_file_mode);
+    ADD CONSTRAINT commit_stats_pkey PRIMARY KEY (repo_id, file_path, commit_hash);
 
 
 --
@@ -2815,6 +2832,13 @@ CREATE INDEX idx_git_commits_repo_id_hash_parents ON public.git_commits USING bt
 --
 
 CREATE INDEX idx_repos_repo_import_id_fkey ON public.repos USING btree (repo_import_id);
+
+
+--
+-- Name: repos_is_duplicate; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX repos_is_duplicate ON public.repos USING btree (is_duplicate);
 
 
 --
@@ -3213,6 +3237,7 @@ GRANT USAGE ON SCHEMA mergestat TO mergestat_role_queries_only;
 -- Name: SCHEMA public; Type: ACL; Schema: -; Owner: -
 --
 
+REVOKE USAGE ON SCHEMA public FROM PUBLIC;
 GRANT USAGE ON SCHEMA public TO readaccess;
 GRANT USAGE ON SCHEMA public TO mergestat_admin WITH GRANT OPTION;
 GRANT USAGE ON SCHEMA public TO mergestat_role_readonly;
