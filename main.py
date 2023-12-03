@@ -30,8 +30,22 @@ def init():
     Base.prepare(conn.engine, schema="mergestat")
 
     Provider = Base.classes.providers
+    Vendor = Base.classes.vendors
+    VendorType = Base.classes.vendor_types
 
     with conn.session as sess:
+        stmt = insert(VendorType).values([
+            {'name': 'git', 'display_name': 'Git'}
+        ])
+        stmt = stmt.on_conflict_do_nothing()
+        sess.execute(stmt)
+
+        stmt = insert(Vendor).values([
+            {'name': 'local', 'display_name': 'Local', 'type': 'git'}
+        ])
+        stmt = stmt.on_conflict_do_nothing()
+        sess.execute(stmt)
+
         stmt = insert(Provider).values([
             {"name": "Gitolite", "vendor": "local", "settings": {
                 'host': os.environ["GITOLITE_HOST"],
@@ -57,12 +71,12 @@ def init():
 
 
 def clone_repo_list(conn: SQLConnection) -> None:
-    repos = conn.query("select repo, settings->>'root' as root, settings->>'origin' as origin from repos", ttl=0)['repo']
+    repos = conn.query("select repo, settings->>'root' as root, settings->>'origin' as origin from repos", ttl=0)
 
     progress = st.progress(0, text=f"0/{len(repos)} repos")
     done = 0
     with st.status("Cloning...", expanded=True) as status:
-        for repo in repos:
+        for _, repo in repos.iterrows():
             repo_path = Path(repo['root'])
 
             dir_path = repo_path.parent
@@ -81,7 +95,11 @@ def clone_repo_list(conn: SQLConnection) -> None:
                 result = subprocess.Popen(["git", "clone", "--bare", repo_url], cwd=dir_path, stderr=subprocess.STDOUT, stdout=subprocess.PIPE)
                 for line in iter(lambda: result.stdout.readline(), b""):
                     st.text(line.decode("utf-8"))
-                subprocess.run(["git", "config", "remote.origin.fetch", "+*:*"], cwd=repo_path)
+                try:
+                    subprocess.run(["git", "config", "remote.origin.fetch", "+*:*"], cwd=repo_path)
+                except FileNotFoundError:
+                    st.text("Clone failed")
+
 
             done += 1
             progress.progress(done / len(repos), text=f"{done}/{len(repos)} repos")
@@ -93,7 +111,7 @@ def fetch_gitolite(provider_id: str, settings: dict) -> pd.DataFrame:
     host = settings['host']
 
     repo_list = subprocess.run(
-        ['bash', '-c', f'ssh "{host}" 2>/dev/null | tail -n +3 | cut -b6-'],
+        ['bash', '-c', f'ssh {host} 2>/dev/null | tail -n +3 | cut -b6-'],
         stdout=subprocess.PIPE
     ).stdout.decode('utf-8').splitlines()
 
@@ -129,32 +147,28 @@ def fetch_gitlab(provider_id: str, settings: dict) -> pd.DataFrame:
 
 
 def index_current_files(repo_object):
-    try:
-        repo = git.Repo(repo_object['root'])
-        head = repo.head.commit
-    except git.exc.NoSuchPathError:
-        return 0
-    except ValueError:
+    if not (repo := get_repo(repo_object['root'])):
         return 0
 
     files = []
-    for f in head.tree.list_traverse():
+    for f in repo.head.commit.tree.list_traverse():
         if f.type == 'blob':
             files.append([
                 repo_object['id'],
                 str(f.path).encode('utf-8','ignore').decode("utf-8"),
                 f.file_mode & 0o100,
+                f.size,
             ])
-    df = pd.DataFrame(files, columns=['repo_id', 'path', 'executable']);
+    df = pd.DataFrame(files, columns=['repo_id', 'path', 'executable', 'size']);
 
-    with conn.engine.connect() as conn2:
+    with conn.engine.begin() as conn2:
         cursor = conn2.connection.cursor()
 
         s_buf = StringIO()
         df.to_csv(s_buf, sep="\t", index=False, header=False, date_format='%Y-%m-%dT%H:%M:%S')
         s_buf.seek(0)
         cursor.execute("CREATE TEMP TABLE tmp_table (LIKE git_files INCLUDING DEFAULTS) on commit drop")
-        cursor.copy_expert("COPY tmp_table (repo_id, path, executable) FROM STDIN (FORMAT CSV, delimiter E'\\t')", s_buf)
+        cursor.copy_expert("COPY tmp_table (repo_id, path, executable, size) FROM STDIN (FORMAT CSV, delimiter E'\\t')", s_buf)
         cursor.execute("DELETE FROM git_files where repo_id = (select repo_id from tmp_table limit 1)")
         cursor.execute("INSERT INTO git_files SELECT * FROM tmp_table ON CONFLICT DO NOTHING RETURNING 1")
         inserted = cursor.fetchall()
@@ -329,12 +343,40 @@ def main():
         should_clone = st.button("Clone/fetch all repos")
         should_index_commits = st.button("Index commits")
         should_index_files = st.button("Index current files")
+        should_find_duplicates = st.button("Find duplicates")
         provider = select_provider(conn)
         p_provider = provider['id'] if provider is not None and not provider.empty else None
-        p_repo = st.text_input('Repository (SQL-like, with % as *)', '') or "%"
-        p_name = st.text_input('Author name (SQL-like, with % as *)', '') or "%"
-        p_email = st.text_input('Author e-mail (SQL-like, with % as *)', '') or "%"
-
+        p_repo = st.text_input('Repository (regex)', '') or ""
+        p_negrepo = st.text_input('Repository exclusion (regex)', '') or "^$"
+        p_author = st.text_input('Author name/email (regex)', '') or ""
+        p_negauthor = st.text_input('Author name/email exclusion (regex)', '') or "^$"
+        granularity = st.selectbox("Graph granularity", options=['year', 'month', 'week', 'day']) or 'week'
+        time_range = conn.query("select date_trunc('month', min(author_when) - interval '15 day')::date as min, date_trunc('month', max(author_when) + interval '15 day')::date as max from git_commits", ttl=3600)
+        time_range = pd.date_range(start=time_range['min'][0], end=time_range['max'][0], freq='MS')
+        time_range = st.select_slider(
+            "Month range",
+            options=time_range,
+            value=(time_range[0], time_range[-1]),
+            format_func=lambda x: str(x)[0:7]
+        )
+        basic_filter = """
+        where not is_duplicate
+        and case when :id is null then true else provider = :id end
+        and repo ~* :p_repo and repo !~* :p_negrepo
+        and (author_name ~* :p_author or author_email ~* :p_author)
+        and (author_name !~* :p_negauthor and author_email !~* :p_negauthor)
+        and author_when between :from and :to
+        """
+        params = {
+            'id': p_provider,
+            'p_repo': p_repo,
+            'p_negrepo': p_negrepo,
+            'p_author': p_author,
+            'p_negauthor': p_negauthor,
+            'from': time_range[0],
+            'to': time_range[1],
+            'granularity': granularity,
+        }
 
     if refresh_gitolite or refresh_gitlab:
         refresh_repo_list(gitolite=refresh_gitolite)
@@ -378,7 +420,7 @@ def main():
         progress.empty()
         status.update(label=f"Indexed {len(repos)} repos", state="complete", expanded=False)
 
-    if st.sidebar.button("Find duplicates"):
+    if should_find_duplicates:
         with conn.session as sess:
             cursor = sess.connection().connection.cursor()
             cursor.execute("""
@@ -393,93 +435,80 @@ def main():
             """)
             sess.commit()
 
-    last_active = conn.query("""
+    last_active = conn.query(f"""
     select repo, message, author_when, author_name, author_email
     from repos join git_commits on repo_id=repos.id
-    where not is_duplicate and case when :id is null then true else provider = :id end and repo like :p_repo and author_name like :p_name and author_email like :p_email
-    order by author_when desc limit 100
-    """, params={'id': p_provider, 'p_repo': p_repo, 'p_name': p_name, 'p_email': p_email}, ttl=3600)
+    {basic_filter} order by author_when desc limit 100
+    """, params=params, ttl=3600)
     last_active.set_index(keys=['author_when'], drop=True, inplace=True)
     st.markdown("### Last commit activity")
     st.write(last_active)
 
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3 = st.columns([3, 2, 4])
     with col1:
-        most_active = conn.query("""
+        most_active = conn.query(f"""
         select repos.repo, count(*) as commits
         from repos join git_commits on repo_id=repos.id
-        where not is_duplicate and case when :id is null then true else provider = :id end and repo like :p_repo and author_name like :p_name and author_email like :p_email
-        group by repos.repo order by count(hash) desc limit 100
-        """, params={'id': p_provider, 'p_repo': p_repo, 'p_name': p_name, 'p_email': p_email}, ttl=3600)
+        {basic_filter} group by repos.repo order by count(hash) desc limit 100
+        """, params=params, ttl=3600)
         st.markdown("### Most active repositories")
-        st.write(most_active)
+        st.dataframe(most_active, hide_index=True)
     with col2:
-        authors = conn.query("""
+        authors = conn.query(f"""
         select author_email, count(*) as commits
         from repos join git_commits on repo_id=repos.id
-        where not is_duplicate and case when :id is null then true else provider = :id end and repo like :p_repo and author_name like :p_name and author_email like :p_email
-        group by author_email order by count(hash) desc limit 100
-        """, params={'id': p_provider, 'p_repo': p_repo, 'p_name': p_name, 'p_email': p_email}, ttl=3600)
+        {basic_filter} group by author_email order by count(hash) desc limit 100
+        """, params=params, ttl=3600)
         st.markdown("### Most active authors")
-        st.write(authors)
+        st.dataframe(authors, hide_index=True)
     with col3:
-        authors = conn.query("""
-        select committer_email, count(*) as commits
-        from repos join git_commits on repo_id=repos.id
-        where not is_duplicate and case when :id is null then true else provider = :id end and repo like :p_repo and author_name like :p_name and author_email like :p_email
-        group by committer_email order by count(hash) desc limit 100
-        """, params={'id': p_provider, 'p_repo': p_repo, 'p_name': p_name, 'p_email': p_email}, ttl=3600)
-        st.markdown("### Most active committers")
-        st.write(authors)
+        st.markdown("### Most active files")
+        files = conn.query(f"""
+        select count(*) as commits, repo, s.file_path
+        from repos join git_commits on repo_id=repos.id join git_commit_stats s on hash=s.commit_hash
+        {basic_filter} group by file_path, repo order by count(*) desc limit 100
+        """, params=params, ttl=3600)
+        st.dataframe(files, hide_index=True)
 
     st.markdown("### Commit count timeline")
-    granularity = st.selectbox("Graph granularity", options=['year', 'month', 'week', 'day']) or 'week'
-    per_period = conn.query("""
+    per_period = conn.query(f"""
     select date_trunc(:granularity, author_when) as author_when, providers.name as provider, count(*)
     from repos join git_commits on repo_id=repos.id join mergestat.providers on provider=providers.id
-    where not is_duplicate and case when :id is null then true else provider = :id end and repo like :p_repo and author_name like :p_name and author_email like :p_email
-    group by date_trunc(:granularity, author_when), providers.name order by author_when desc, providers.name desc
-    """, params={'id': p_provider, 'p_repo': p_repo, 'p_name': p_name, 'p_email': p_email, 'granularity': granularity}, ttl=3600)
+    {basic_filter} group by date_trunc(:granularity, author_when), providers.name order by author_when desc, providers.name desc
+    """, params=params, ttl=3600)
     per_period.set_index(keys=['author_when'], drop=True, inplace=True)
     st.bar_chart(per_period, color='provider', y='count')
 
-    # st.markdown("### Most active files")
-    # files = conn.query("""
-    # select count(*) as commits, repo, s.file_path
-    # from repos join git_commits on repo_id=repos.id join git_commit_stats s on hash=s.commit_hash
-    # where not is_duplicate and case when :id is null then true else provider = :id end and repo like :p_repo and author_name like :p_name and author_email like :p_email
-    # group by file_path, repo order by count(*) desc limit 100
-    # """, params={'id': p_provider, 'p_repo': p_repo, 'p_name': p_name, 'p_email': p_email}, ttl=3600)
-    # st.write(files)
-
     st.markdown("### Lines added/removed timeline")
-    per_period = conn.query("""
+    per_period = conn.query(f"""
     select date_trunc(:granularity, author_when) as author_when, sum(s.additions) as added, sum(s.deletions) as deleted
     from repos join git_commits on repo_id=repos.id join git_commit_stats s on hash=s.commit_hash
-    where not is_duplicate and case when :id is null then true else provider = :id end and repo like :p_repo and author_name like :p_name and author_email like :p_email
-    group by date_trunc(:granularity, author_when), provider order by author_when desc
-    """, params={'id': p_provider, 'p_repo': p_repo, 'p_name': p_name, 'p_email': p_email, 'granularity': granularity}, ttl=3600)
+    {basic_filter} group by date_trunc(:granularity, author_when), provider order by author_when desc
+    """, params=params, ttl=3600)
     per_period.set_index(keys=['author_when'], drop=True, inplace=True)
     st.bar_chart(per_period, y=['added', 'deleted'])
 
+
     st.markdown("### Activity chart (GitHub contribution graph)")
-    per_period = conn.query("""
+    per_period = conn.query(f"""
     select date_trunc('day', author_when) as date, count(*) as count
     from repos join git_commits on repo_id=repos.id
-    where not is_duplicate and case when :id is null then true else provider = :id end and repo like :p_repo and author_name like :p_name and author_email like :p_email
-    group by date_trunc('day', author_when) order by date desc
-    """, params={'id': p_provider, 'p_repo': p_repo, 'p_name': p_name, 'p_email': p_email, 'granularity': granularity}, ttl=3600)
+    {basic_filter} group by date_trunc('day', author_when) order by date desc
+    """, params=params, ttl=3600)
     per_period.set_index(keys=['date'], drop=False, inplace=True)
 
-
-    years = per_period['date'].dt.year
-    year_range = range(years.max(), years.min() - 1, -1)
+    if per_period.empty:
+        per_period = pd.DataFrame(columns=['date', 'count'])
+        years = pd.Series()
+        year_range = [2023]
+    else:
+        years = per_period['date'].dt.year
+        year_range = range(years.max(), years.min() - 1, -1)
     tabs = st.tabs([str(year) for year in year_range])
     for idx, year in enumerate(year_range):
         with tabs[idx]:
             per_year = per_period[years == year]['count']
-            scale_max = per_year.quantile(.95)
-            scale = alt.Scale(domain=[1, scale_max])
+            scale = alt.Scale(domain=[1, per_year.quantile(.95) or 30])
             per_year = per_year.reindex(
                 pd.date_range(f'01-01-{year}', f'12-31-{year}', tz='UTC', name='date'),
                 fill_value=0
@@ -488,7 +517,6 @@ def main():
             chart = alt.Chart(per_year, title=f"Activity chart for year {year}").mark_rect().encode(
                 alt.X("week(date):O").title("Month"),
                 alt.Y('day(date):O').title("Day"),
-                # alt.Y('date:T', timeUnit='day', type='ordinal', sort=['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday']).title("Day"),
                 alt.Color("count:Q", scale=scale).title(None),
                 tooltip=[
                     alt.Tooltip("monthdate(date)", title="Date"),
@@ -499,6 +527,20 @@ def main():
             )
             st.altair_chart(chart, use_container_width=True)
 
+    st.markdown("### Last touched vs commits/files")
+    old_repos = conn.query(f"""
+    select max(date_trunc('day', author_when)) as last_touched, repo, count(*) as commits, max(files) as files
+    from repos join git_commits on repo_id=repos.id
+    left join lateral (select repo_id, count(*) as files from git_files group by repo_id) t on t.repo_id=repos.id
+    {basic_filter} group by repo order by last_touched desc
+    """, params=params, ttl=3600)
+    c = alt.Chart(old_repos).mark_point().encode(
+        alt.X('last_touched:T'),
+        alt.Y('files:Q'),
+        size='commits:Q',
+        tooltip=['repo:N', 'commits:Q', 'files:Q', 'last_touched:T'],
+    )
+    st.altair_chart(c, use_container_width=True)
 
 if __name__ == '__main__':
     main()
