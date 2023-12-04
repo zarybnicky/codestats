@@ -9,8 +9,8 @@ services:
     volumes:
       - streamlit:/data/streamlit
       - ./:/app
-      - ../repos-gitlab:/repos-gitlab
-      - ../repos-gitolite:/repos-gitolite
+      - $GITLAB_ROOT:/repos-gitlab
+      - $GITOLITE_ROOT:/repos-gitolite
       - ${SSH_AUTH_SOCK}:${SSH_AUTH_SOCK}
       - ~/.ssh:/home/inuits/.ssh
     depends_on:

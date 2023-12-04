@@ -2,148 +2,21 @@
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import StringIO
-import json
 import os
 import os.path
-from pathlib import Path
 import subprocess
 from typing import Tuple
 
 import altair as alt
 import git
 import git.exc
-import requests
 import streamlit as st
 import pandas as pd
-from sqlalchemy.dialects.postgresql import insert
-from sqlalchemy.ext.automap import automap_base
 from streamlit.connections import SQLConnection
 from streamlit.runtime.scriptrunner import add_script_run_ctx
 
 st.set_page_config(layout="wide")
 conn: SQLConnection = st.connection("sql", url=os.environ["SQLALCHEMY_DATABASE_URL"])
-
-
-def init():
-    Base = automap_base()
-    Base.prepare(conn.engine)
-    Base.prepare(conn.engine, schema="mergestat")
-
-    Provider = Base.classes.providers
-    Vendor = Base.classes.vendors
-    VendorType = Base.classes.vendor_types
-
-    with conn.session as sess:
-        stmt = insert(VendorType).values([
-            {'name': 'git', 'display_name': 'Git'}
-        ])
-        stmt = stmt.on_conflict_do_nothing()
-        sess.execute(stmt)
-
-        stmt = insert(Vendor).values([
-            {'name': 'local', 'display_name': 'Local', 'type': 'git'}
-        ])
-        stmt = stmt.on_conflict_do_nothing()
-        sess.execute(stmt)
-
-        stmt = insert(Provider).values([
-            {"name": "Gitolite", "vendor": "local", "settings": {
-                'host': os.environ["GITOLITE_HOST"],
-                'root': os.environ["GITOLITE_ROOT"],
-                'origin': f"ssh://{os.environ['GITOLITE_HOST']}/",
-            }},
-            {"name": "Gitlab", "vendor": "local", "settings": {
-                'host': os.environ["GITLAB_HOST"],
-                'user': os.environ["GITLAB_USER"],
-                'token': os.environ["GITLAB_TOKEN"],
-                'root': os.environ["GITLAB_ROOT"],
-                'origin': f"https://{os.environ['GITLAB_USER']}:{os.environ['GITLAB_TOKEN']}@{os.environ['GITLAB_HOST']}/",
-            }}
-        ])
-        stmt = stmt.on_conflict_do_update(
-            index_elements=[Provider.name],
-            set_=dict(settings=stmt.excluded.settings)
-        )
-        sess.execute(stmt)
-        sess.commit()
-
-    return conn
-
-
-def clone_repo_list(conn: SQLConnection) -> None:
-    repos = conn.query("select repo, settings->>'root' as root, settings->>'origin' as origin from repos", ttl=0)
-
-    progress = st.progress(0, text=f"0/{len(repos)} repos")
-    done = 0
-    with st.status("Cloning...", expanded=True) as status:
-        for _, repo in repos.iterrows():
-            repo_path = Path(repo['root'])
-
-            dir_path = repo_path.parent
-            dir_path.mkdir(parents=True, exist_ok=True)
-
-            if repo_path.is_dir():
-                st.write(f"Fetching {repo['repo']}")
-
-                result = subprocess.Popen(["git", "fetch", "--prune"], cwd=repo_path, stderr=subprocess.STDOUT, stdout=subprocess.PIPE)
-                for line in iter(lambda: result.stdout.readline(), b""):
-                    st.text(line.decode("utf-8"))
-            else:
-                repo_url = repo['origin']
-                st.write(f"Cloning from {repo_url}")
-
-                result = subprocess.Popen(["git", "clone", "--bare", repo_url], cwd=dir_path, stderr=subprocess.STDOUT, stdout=subprocess.PIPE)
-                for line in iter(lambda: result.stdout.readline(), b""):
-                    st.text(line.decode("utf-8"))
-                try:
-                    subprocess.run(["git", "config", "remote.origin.fetch", "+*:*"], cwd=repo_path)
-                except FileNotFoundError:
-                    st.text("Clone failed")
-
-
-            done += 1
-            progress.progress(done / len(repos), text=f"{done}/{len(repos)} repos")
-        progress.empty()
-        status.update(label=f"Cloned/fetched {done} repos", state="complete", expanded=False)
-
-
-def fetch_gitolite(provider_id: str, settings: dict) -> pd.DataFrame:
-    host = settings['host']
-
-    repo_list = subprocess.run(
-        ['bash', '-c', f'ssh {host} 2>/dev/null | tail -n +3 | cut -b6-'],
-        stdout=subprocess.PIPE
-    ).stdout.decode('utf-8').splitlines()
-
-    df = pd.DataFrame((f"{x}.git" for x in repo_list), columns=['repo'])
-    df['provider'] = provider_id
-    df['settings'] = df['repo'].map(lambda n: json.dumps({
-        'root': os.path.join(settings['root'], n),
-        'origin': os.path.join(settings['origin'], n),
-    }))
-    return df
-
-
-def fetch_gitlab(provider_id: str, settings: dict) -> pd.DataFrame:
-    host = settings['host']
-    token = settings['token']
-
-    page = 1
-    repo_list = []
-    while True:
-        results = requests.get(f"https://{host}/api/v4/projects?simple=true&private_token={token}&per_page=100&page={page}").json()
-        if not results:
-            break
-        repo_list.extend('/'.join(x['ssh_url_to_repo'].split('/')[3:]) for x in results)
-        page += 1
-
-    df = pd.DataFrame(repo_list, columns=['repo'])
-    df['provider'] = provider_id
-    df['settings'] = df['repo'].map(lambda n: json.dumps({
-        'root': os.path.join(settings['root'], n),
-        'origin': os.path.join(settings['origin'], n),
-    }))
-    return df
 
 
 def index_current_files(repo_object):
@@ -309,50 +182,17 @@ def select_repo(conn, provider) -> str | None:
         return
 
 
-def refresh_repo_list(gitolite: bool):
-    providers = conn.query('select * from mergestat.providers', ttl=3600)
-    provider_name = "Gitolite" if gitolite else "Gitlab"
-    provider = providers[providers['name'] == provider_name].iloc[0]
-    fetcher = fetch_gitolite if gitolite else fetch_gitlab
-
-    with st.status("Refreshing...", expanded=True) as status:
-        st.write(provider)
-        repos = fetcher(provider['id'], provider['settings'])
-        st.write(f"Found {len(repos)} repos")
-
-        with conn.session as sess:
-            cursor = sess.connection().connection.cursor()
-            s_buf = StringIO()
-            repos.to_csv(s_buf, sep="\t", index=False, header=False, date_format='%Y-%m-%dT%H:%M:%S')
-            s_buf.seek(0)
-            cursor.execute("CREATE TEMP TABLE tmp_table (LIKE repos INCLUDING DEFAULTS) on commit drop")
-            cursor.copy_expert("COPY tmp_table (repo, provider, settings) FROM STDIN WITH (FORMAT CSV, delimiter E'\\t')", s_buf)
-            cursor.execute("INSERT INTO repos SELECT * FROM tmp_table on conflict do nothing RETURNING repo")
-            inserted = cursor.fetchall()
-            count = len(inserted)
-            st.write([x[0] for x in inserted])
-            sess.commit()
-
-        st.write(f"Inserted new {count} repos")
-        status.update(label=f"Found {count} new repos", state="complete", expanded=False)
-
-
 def main():
-    conn = init()
-
     with st.sidebar:
-        refresh_gitolite = st.button("List Gitolite")
-        refresh_gitlab = st.button("List Gitlab")
-        should_clone = st.button("Clone/fetch all repos")
         should_index_commits = st.button("Index commits")
         should_index_files = st.button("Index current files")
         should_find_duplicates = st.button("Find duplicates")
         provider = select_provider(conn)
         p_provider = provider['id'] if provider is not None and not provider.empty else None
         p_repo = st.text_input('Repository (regex)', '') or ""
-        p_negrepo = st.text_input('Repository exclusion (regex)', '') or "^$"
+        p_negrepo = st.text_input('Repository exclusion (regex)', 'mautic|matomo|imagemagick|osm2pgsql|simplesamle-php-upstream') or "^$"
         p_author = st.text_input('Author name/email (regex)', '') or ""
-        p_negauthor = st.text_input('Author name/email exclusion (regex)', '') or "^$"
+        p_negauthor = st.text_input('Author name/email exclusion (regex)', 'lctl.gov|immerda.ch|unige.ch|bastelfreak.de|kohlvanwijngaarden.nl') or "^$"
         granularity = st.selectbox("Graph granularity", options=['year', 'month', 'week', 'day']) or 'week'
         time_range = conn.query("select date_trunc('month', min(author_when) - interval '15 day')::date as min, date_trunc('month', max(author_when) + interval '15 day')::date as max from git_commits", ttl=3600)
         time_range = pd.date_range(start=time_range['min'][0], end=time_range['max'][0], freq='MS')
@@ -380,12 +220,6 @@ def main():
             'to': time_range[1],
             'granularity': granularity,
         }
-
-    if refresh_gitolite or refresh_gitlab:
-        refresh_repo_list(gitolite=refresh_gitolite)
-
-    if should_clone:
-        clone_repo_list(conn)
 
     if should_index_commits:
         repos = conn.query("select id, repo, settings->>'root' as root from repos", ttl=0)
