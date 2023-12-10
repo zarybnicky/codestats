@@ -1,53 +1,43 @@
 #!/usr/bin/env python3
 
-import os
 from pathlib import Path
 import subprocess
 
-from dotenv import load_dotenv
-from sqlalchemy import create_engine, select
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from schema import Repos
-from utils import prefill_and_reroot
+from utils import with_env_and_session
 
-def main():
-    load_dotenv(override=False)
+def fetch_known_repos(sess: Session):
+    repos = sess.scalars(select(Repos)).all()
 
-    engine = create_engine(url=os.environ["SQLALCHEMY_DATABASE_URL"])
+    for repo in repos:
+        root = Path(repo.settings['root'])
+        origin = repo.settings['origin']
 
-    with Session(engine) as sess:
-        prefill_and_reroot(sess)
-        sess.commit()
+        dir_path = root.parent
+        dir_path.mkdir(parents=True, exist_ok=True)
 
-        repos = sess.scalars(select(Repos)).all()
+        if root.is_dir():
+            print(f"Fetching {repo.repo}")
 
-        for repo in repos:
-            root = Path(repo.settings['root'])
-            origin = repo.settings['origin']
+            result = subprocess.Popen(["git", "fetch", "--prune"], cwd=root, stderr=subprocess.STDOUT, stdout=subprocess.PIPE)
+            for line in iter(lambda: result.stdout.readline(), b""):
+                print(line.decode("utf-8"))
+            if result.wait() != 0:
+                print("Failed to fetch")
+        else:
+            print(f"Cloning {repo.repo}")
 
-            dir_path = root.parent
-            dir_path.mkdir(parents=True, exist_ok=True)
-
-            if root.is_dir():
-                print(f"Fetching {repo.repo}")
-
-                result = subprocess.Popen(["git", "fetch", "--prune"], cwd=root, stderr=subprocess.STDOUT, stdout=subprocess.PIPE)
-                for line in iter(lambda: result.stdout.readline(), b""):
-                    print(line.decode("utf-8"))
-                if result.wait() != 0:
-                    print("Failed to fetch")
-            else:
-                print(f"Cloning {repo.repo}")
-
-                result = subprocess.Popen(["git", "clone", "--bare", origin], cwd=dir_path, stderr=subprocess.STDOUT, stdout=subprocess.PIPE)
-                for line in iter(lambda: result.stdout.readline(), b""):
-                    print(line.decode("utf-8"))
-                try:
-                    subprocess.run(["git", "config", "remote.origin.fetch", "+*:*"], cwd=root)
-                except FileNotFoundError:
-                    print("Clone failed")
+            result = subprocess.Popen(["git", "clone", "--bare", origin], cwd=dir_path, stderr=subprocess.STDOUT, stdout=subprocess.PIPE)
+            for line in iter(lambda: result.stdout.readline(), b""):
+                print(line.decode("utf-8"))
+            try:
+                subprocess.run(["git", "config", "remote.origin.fetch", "+*:*"], cwd=root)
+            except FileNotFoundError:
+                print("Clone failed")
 
 
 if __name__ == '__main__':
-    main()
+    with_env_and_session(fetch_known_repos)

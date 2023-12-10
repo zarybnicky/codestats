@@ -15,6 +15,7 @@ gitpython = "^3.1.40"
 # git-pandas = {git = "https://github.com/wdm0006/git-pandas"}
 sqlacodegen = "3.0.0rc3"
 python-dotenv = "^1.0.0"
+humanize = "^4.9.0"
 
 [tool.pyright]
 include = ['.']

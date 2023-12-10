@@ -1,11 +1,33 @@
 #!/usr/bin/env python3
 
 import os
-from sqlalchemy import text
+from typing import Callable
+
+from dotenv import load_dotenv
+from sqlalchemy import Engine, create_engine, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
 from schema import VendorTypes, Vendors, Providers
+
+
+def with_env_and_engine(fn: Callable[[Engine], None]):
+    load_dotenv(override=False)
+
+    engine = create_engine(url=os.environ["SQLALCHEMY_DATABASE_URL"])
+
+    with Session(engine) as sess:
+        prefill_and_reroot(sess)
+        sess.commit()
+
+    fn(engine)
+
+
+def with_env_and_session(fn: Callable[[Session], None]):
+    def f(engine: Engine):
+        with Session(engine) as sess:
+            fn(sess)
+    with_env_and_engine(f)
 
 
 def prefill_and_reroot(sess: Session):

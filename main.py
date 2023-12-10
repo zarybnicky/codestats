@@ -1,167 +1,18 @@
 #!/usr/bin/env python3
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from io import StringIO
 import os
 import os.path
-import subprocess
-from typing import Tuple
 
 import altair as alt
 import git
 import git.exc
+import humanize
 import streamlit as st
 import pandas as pd
 from streamlit.connections import SQLConnection
-from streamlit.runtime.scriptrunner import add_script_run_ctx
 
 st.set_page_config(layout="wide")
 conn: SQLConnection = st.connection("sql", url=os.environ["SQLALCHEMY_DATABASE_URL"])
-
-
-def index_current_files(repo_object):
-    if not (repo := get_repo(repo_object['root'])):
-        return 0
-
-    files = []
-    for f in repo.head.commit.tree.list_traverse():
-        if f.type == 'blob':
-            path = str(f.path).encode('utf-8','ignore').decode("utf-8")
-            ext = os.path.splitext(path)[1] or os.path.basename(path)
-            files.append([
-                repo_object['id'],
-                path,
-                f.file_mode & 0o100,
-                f.size,
-                ext,
-            ])
-    df = pd.DataFrame(files, columns=['repo_id', 'path', 'executable', 'size', 'ext']);
-
-    with conn.engine.begin() as conn2:
-        cursor = conn2.connection.cursor()
-
-        s_buf = StringIO()
-        df.to_csv(s_buf, sep="\t", index=False, header=False, date_format='%Y-%m-%dT%H:%M:%S')
-        s_buf.seek(0)
-        cursor.execute("CREATE TEMP TABLE tmp_table (LIKE git_files INCLUDING DEFAULTS) on commit drop")
-        cursor.copy_expert("COPY tmp_table (repo_id, path, executable, size, ext) FROM STDIN (FORMAT CSV, delimiter E'\\t')", s_buf)
-        cursor.execute("DELETE FROM git_files where repo_id = (select repo_id from tmp_table limit 1)")
-        cursor.execute("INSERT INTO git_files SELECT * FROM tmp_table ON CONFLICT DO NOTHING RETURNING 1")
-        inserted = cursor.fetchall()
-        count = len(inserted)
-        conn2.commit()
-        return count
-
-
-def get_repo(root: str) -> git.Repo | None:
-    try:
-        repo = git.Repo(root)
-        _ = repo.head.commit
-        return repo
-    except git.exc.NoSuchPathError:
-        return None
-    except ValueError:
-        return None
-
-
-def index_commits(repo_object: dict) -> Tuple[int, int]:
-    root = repo_object['root']
-    if get_repo(root) is None:
-        return (0, 0)
-
-    result = subprocess.Popen(
-        ['git', 'log', "--pretty=format:|%H|%an|%ae|%at|%cn|%ce|%ct|%p|%s", '--numstat'],
-        cwd=root, stdout=subprocess.PIPE,
-    )
-    commits = []
-    commit_stats = []
-    last_commit = None
-    for line in iter(lambda: result.stdout.readline(), b""):
-        line = line.decode('utf-8').lstrip()
-        if not line:
-            continue
-        if line.startswith('|'):
-            x = line.split('|', maxsplit=10)
-            commits.append([
-                repo_object['id'],
-                x[1],
-                x[9].strip(),
-                x[2],
-                x[3],
-                int(x[4]),
-                x[5],
-                x[6],
-                int(x[7]),
-                len([y for y in x[8].split() if y.strip()]),
-            ])
-            last_commit = x[1]
-        else:
-            x = line.split()
-            if x[0] == '-' and x[1] == '-':
-                continue
-            commit_stats.append([
-                repo_object['id'],
-                last_commit,
-                x[2],
-                int(x[0]),
-                int(x[1]),
-            ])
-
-    df = pd.DataFrame(commits, columns=[
-        'repo_id',
-        'hash',
-        'message',
-        'author_name',
-        'author_email',
-        'author_when',
-        'committer_name',
-        'committer_email',
-        'committer_when',
-        'parents'
-    ])
-    df['author_when'] = pd.to_datetime(df['author_when'], unit='s', origin='unix')
-    df['committer_when'] = pd.to_datetime(df['committer_when'], unit='s', origin='unix')
-    s_buf = StringIO()
-    df.to_csv(s_buf, sep="\t", index=False, header=False, date_format='%Y-%m-%dT%H:%M:%S')
-    s_buf.seek(0)
-
-    with conn.engine.begin() as conn2:
-        cursor = conn2.connection.cursor()
-        cursor.execute("CREATE TEMP TABLE tmp_table (LIKE git_commits INCLUDING DEFAULTS) on commit drop")
-        cursor.copy_expert("COPY tmp_table (repo_id, hash, message, author_name, author_email, author_when, committer_name, committer_email, committer_when, parents) FROM STDIN (FORMAT CSV, delimiter E'\\t')", s_buf)
-        cursor.execute("DELETE FROM git_commits where repo_id = (select repo_id from tmp_table limit 1)")
-        cursor.execute("with rows as (INSERT INTO git_commits SELECT * FROM tmp_table ON CONFLICT DO NOTHING RETURNING 1) select count(*) from rows");
-        commit_count = cursor.fetchone()[0]
-        conn2.commit()
-
-    df = pd.DataFrame(commit_stats, columns=[
-        'repo_id',
-        'commit_hash',
-        'file_path',
-        'additions',
-        'deletions',
-    ])
-    s_buf = StringIO()
-    df.to_csv(s_buf, sep="\t", index=False, header=False, date_format='%Y-%m-%dT%H:%M:%S')
-    s_buf.seek(0)
-
-    with conn.engine.begin() as conn2:
-        cursor = conn2.connection.cursor()
-        cursor.execute("CREATE TEMP TABLE tmp_table (LIKE git_commit_stats INCLUDING DEFAULTS) on commit drop")
-        cursor.copy_expert("COPY tmp_table (repo_id, commit_hash, file_path, additions, deletions) FROM STDIN (FORMAT CSV, delimiter E'\\t')", s_buf)
-        cursor.execute("DELETE FROM git_commit_stats where repo_id = (select repo_id from tmp_table limit 1)")
-        cursor.execute("with rows as (INSERT INTO git_commit_stats SELECT * FROM tmp_table ON CONFLICT DO NOTHING RETURNING 1) select count(*) from rows")
-        patch_count = cursor.fetchone()[0]
-        conn2.commit()
-
-    return commit_count, patch_count
-
-
-def select_provider(conn):
-    providers = conn.query('select id, name, settings from mergestat.providers', ttl=3600)
-    provider_name = st.selectbox("Forge", options=providers['name'], index=None)
-    selected = providers[providers['name'] == provider_name]
-    return None if selected.empty else selected.iloc[0]
 
 
 def select_repo(conn, provider) -> str | None:
@@ -184,10 +35,11 @@ def select_repo(conn, provider) -> str | None:
 
 def main():
     with st.sidebar:
-        should_index_commits = st.button("Index commits")
-        should_index_files = st.button("Index current files")
-        should_find_duplicates = st.button("Find duplicates")
-        provider = select_provider(conn)
+        providers = conn.query('select id, name, settings from mergestat.providers', ttl=3600)
+        provider_name = st.selectbox("Forge", options=providers['name'], index=None)
+        selected = providers[providers['name'] == provider_name]
+        provider = None if selected.empty else selected.iloc[0]
+
         p_provider = provider['id'] if provider is not None and not provider.empty else None
         p_repo = st.text_input('Repository (regex)', '') or ""
         p_negrepo = st.text_input('Repository exclusion (regex)', 'mautic|matomo|imagemagick|osm2pgsql|simplesamle-php-upstream') or "^$"
@@ -221,59 +73,6 @@ def main():
             'granularity': granularity,
         }
 
-    if should_index_commits:
-        repos = conn.query("select id, repo, settings->>'root' as root from repos", ttl=0)
-
-        progress = st.progress(0, text=f"0/{len(repos)} repos")
-        with st.status("Indexing...", expanded=True) as status:
-            with ThreadPoolExecutor(max_workers=2) as executor:
-                futures = {executor.submit(index_commits, dict(repo)): repo for _, repo in repos.iterrows()}
-                for t in executor._threads:
-                    add_script_run_ctx(t)
-
-                for idx, future in enumerate(as_completed(futures), start=1):
-                    repo = futures[future]
-                    commit_count, patch_count = future.result()
-                    st.write(f"{repo['repo']}: {commit_count} commits and {patch_count} patches")
-                    progress.progress(int(idx) / len(repos), text=f"{idx}/{len(repos)} repos")
-        progress.empty()
-        status.update(label=f"Indexed {len(repos)} repos", state="complete", expanded=False)
-
-    if should_index_files:
-        repos = conn.query("select id, repo, settings->>'root' as root from repos", ttl=0)
-
-        progress = st.progress(0, text=f"0/{len(repos)} repos")
-        with st.status("Indexing...", expanded=True) as status:
-            with ThreadPoolExecutor(max_workers=2) as executor:
-                futures = {executor.submit(index_current_files, dict(repo)): repo for _, repo in repos.iterrows()}
-                for t in executor._threads:
-                    add_script_run_ctx(t)
-
-                for idx, future in enumerate(as_completed(futures), start=1):
-                    repo = futures[future]
-                    count = future.result()
-                    st.write(f"{repo['repo']}: {count} files")
-                    progress.progress(idx / len(repos), text=f"{idx}/{len(repos)} repos")
-        progress.empty()
-        status.update(label=f"Indexed {len(repos)} repos", state="complete", expanded=False)
-
-    if should_find_duplicates:
-        with conn.session as sess:
-            cursor = sess.connection().connection.cursor()
-            cursor.execute("""
-            with exact_mirrors as (
-            select unnest((array_agg(repo))[2:]) as dup
-            from repos
-            left join lateral (select hash as first_rev from git_commits where repo_id=repos.id and parents=0) t2 on true
-            left join lateral (select count(*) as commit_count from git_commits where repo_id=repos.id) t1 on true
-            group by first_rev, commit_count
-            having count(first_rev) > 1
-            ), reverted as (
-              update repos set is_duplicate = false
-            ) update repos set is_duplicate = true where repo in (select dup from exact_mirrors)
-            """)
-            sess.commit()
-
     st.markdown("### Last commit activity")
     last_active = conn.query(f"""
     select repo, message, author_when, author_name, author_email
@@ -303,9 +102,20 @@ def main():
     with col3:
         st.markdown("### Most active files")
         files = conn.query(f"""
-        select count(*) as commits, repo, s.file_path
-        from repos join git_commits on repo_id=repos.id join git_commit_stats s on hash=s.commit_hash
-        {basic_filter} group by file_path, repo order by count(*) desc limit 100
+        with t_repos as (
+          select repos.* from repos join mergestat.providers on provider=providers.id
+          where not is_duplicate
+          and case when :id is null then true else provider = :id end
+          and repo ~* :p_repo and repo !~* :p_negrepo
+        ), t_commits as (
+          select git_commits.* from git_commits join t_repos on t_repos.id=repo_id
+          where (author_name ~* :p_author or author_email ~* :p_author)
+          and (author_name !~* :p_negauthor and author_email !~* :p_negauthor)
+          and author_when between :from and date_trunc('month', :to + interval '31 day')
+        )
+        select count(*) as commits, repo, file_path
+        from git_commit_stats s join t_commits on s.commit_hash=hash join t_repos on t_commits.repo_id=t_repos.id
+        group by s.file_path, repo order by count(*) desc limit 100
         """, params=params, ttl=3600)
         st.dataframe(files, hide_index=True)
 
@@ -374,8 +184,8 @@ def main():
     """, params=params, ttl=3600)
     c = alt.Chart(old_repos).mark_point().encode(
         alt.X('last_touched:T'),
-        alt.Y('files:Q'),
-        size='commits:Q',
+        alt.Y('commits:Q'),
+        size='files:Q',
         tooltip=['repo:N', 'commits:Q', 'files:Q', 'last_touched:T'],
     )
     st.altair_chart(c, use_container_width=True)
@@ -383,8 +193,7 @@ def main():
     st.markdown("### Technologies")
     most_active = conn.query(f"""
     with techs as (
-    select path, ext,
-    case ext
+    select repo_id, path, ext, size, case ext
     when 'Dockerfile' then 'Docker'
     when '.js' then 'JavaScript'
     when '.ts' then 'TypeScript'
@@ -438,36 +247,55 @@ def main():
     when 'LICENSE' then null
     else null end as tech
     from git_files
-    ) select tech, count(*)
+    ) select tech, sum(size) as bytes,
+      (select repo from repos where id=(array_agg(repo_id order by size desc))[1]) as biggest_repo,
+      (array_agg(size order by size desc))[1] as biggest_size,
+      (array_agg(path order by size desc))[1] as biggest_path
     from techs
     where tech is not null and tech <> 'Image' and tech <> 'Text' and tech <> 'Artifact'
     group by tech
-    having count(*) > 2000
-    order by count(*) desc limit 100
+    order by sum(size) desc limit 100
     """, params=params, ttl=3600)
+    most_active['human_bytes'] = most_active['bytes'].apply(humanize.naturalsize)
+    most_active['biggest_size'] = most_active['biggest_size'].apply(humanize.naturalsize)
 
     col1, col2 = st.columns(2)
     with col1:
         c = alt.Chart(most_active).mark_arc(innerRadius=50).encode(
-            theta=alt.Theta("count:Q"),
-            color=alt.Color("tech:N").sort(field='count:Q').scale(scheme="category20"),
-            order="count:Q",
+            theta=alt.Theta("bytes:Q"),
+            color=alt.Color("tech:N").sort(field='bytes:Q').scale(scheme="category20"),
+            order="bytes:Q",
+            tooltip=['human_bytes', 'tech', 'biggest_size', 'biggest_repo', 'biggest_path'],
         )
         st.altair_chart(c)
 
+    most_active = conn.query("""
+    select ext as tech, sum(size) as bytes,
+      (select repo from repos where id=(array_agg(repo_id order by size desc))[1]) as biggest_repo,
+      (array_agg(size order by size desc))[1] as biggest_size,
+      (array_agg(path order by size desc))[1] as biggest_path
+    from git_files
+    group by ext
+    order by bytes desc limit 20
+    """, params=params, ttl=3600)
+    most_active['human_bytes'] = most_active['bytes'].apply(humanize.naturalsize)
+    most_active['biggest_size'] = most_active['biggest_size'].apply(humanize.naturalsize)
     with col2:
-        most_active = conn.query("""
-        select ext as tech, count(*)
-        from git_files
-        group by ext
-        order by count(*) desc limit 20
-        """, params=params, ttl=3600)
         c = alt.Chart(most_active).mark_arc(innerRadius=50).encode(
-            theta=alt.Theta("count:Q"),
-            color=alt.Color("tech:N").sort(field='count:Q').scale(scheme="category20"),
-            order="count:Q",
+            theta=alt.Theta("bytes:Q"),
+            color=alt.Color("tech:N").sort(field='bytes:Q').scale(scheme="category20"),
+            order="bytes:Q",
+            tooltip=['human_bytes', 'tech', 'biggest_size', 'biggest_repo', 'biggest_path'],
         )
         st.altair_chart(c)
+
+
+def sizeof_fmt(num, suffix="B"):
+    for unit in ("", "Ki", "Mi", "Gi", "Ti", "Pi", "Ei", "Zi"):
+        if abs(num) < 1024.0:
+            return f"{num:3.1f}{unit}{suffix}"
+        num /= 1024.0
+    return f"{num:.1f}Yi{suffix}"
 
 
 if __name__ == '__main__':
