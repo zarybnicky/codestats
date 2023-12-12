@@ -1,71 +1,50 @@
 #!/usr/bin/env python3
 
 from io import StringIO
+import io
 import os
 import subprocess
 import multiprocessing
+from queue import Empty
+import sys
+from typing import List
 import pandas as pd
-import git
-import git.exc
-from sqlalchemy import Engine, select, text
+import rich
+from sqlalchemy import Engine, select
 from sqlalchemy.engine.interfaces import DBAPICursor
-from sqlalchemy.orm import Session, scoped_session, sessionmaker
-from schema import Repos
+from sqlalchemy.orm import Session
+from rich.progress import BarColumn, MofNCompleteColumn, Progress
 
+from schema import Repos
 from utils import with_env_and_engine
 
 
-def indexer(engine: Engine, queue: multiprocessing.Queue):
-    while True:
-        repo = queue.get(block=True)
-        if repo is None:
-            break
-        with Session(engine) as sess:
-            sess.execute(text("CREATE TEMP TABLE git_files_tmp (LIKE git_files INCLUDING DEFAULTS) on commit drop"))
-            sess.execute(text("CREATE TEMP TABLE git_commits_tmp (LIKE git_commits INCLUDING DEFAULTS) on commit drop"))
-            sess.execute(text("CREATE TEMP TABLE git_commit_stats_tmp (LIKE git_commit_stats INCLUDING DEFAULTS) on commit drop"))
-            cursor = sess.connection().connection.cursor()
-
-            root = repo.settings['root']
-            print(f"{root}")
-            try:
-                gitrepo = git.Repo(root)
-                _ = gitrepo.head.commit
-            except git.exc.NoSuchPathError:
-                continue
-            except ValueError:
-                continue
-
-            index_commits(cursor, repo)
-            index_current_files(cursor, repo, gitrepo)
-
-            cursor.execute("DELETE FROM git_files where repo_id in (select distinct repo_id from git_files_tmp limit 1)")
-            cursor.execute("with rows as (INSERT INTO git_files SELECT * FROM git_files_tmp ON CONFLICT DO NOTHING RETURNING 1) select count(*) from rows")
-            cursor.execute("DELETE FROM git_commits where repo_id = (select repo_id from git_commits_tmp limit 1)")
-            cursor.execute("with rows as (INSERT INTO git_commits SELECT * FROM git_commits_tmp ON CONFLICT DO NOTHING RETURNING 1) select count(*) from rows");
-            cursor.execute("DELETE FROM git_commit_stats where repo_id = (select repo_id from git_commit_stats_tmp limit 1)")
-            cursor.execute("with rows as (INSERT INTO git_commit_stats SELECT * FROM git_commit_stats_tmp ON CONFLICT DO NOTHING RETURNING 1) select count(*) from rows");
-
-            sess.commit()
-
-
 def index_local_repos(engine: Engine):
-    the_queue = multiprocessing.Queue()
-
+    queue = multiprocessing.JoinableQueue()
+    updates = multiprocessing.JoinableQueue()
+    repos = 0
     with Session(engine) as sess:
-        repos = sess.scalars(select(Repos)).all()
-        for repo in repos:
+        for repo in sess.scalars(select(Repos)).all():
             _ = repo.id
+            _ = repo.repo
             _ = repo.settings
-            the_queue.put(repo)
-
+            queue.put(repo)
+            repos += 1
     engine.dispose()
-    the_pool = multiprocessing.Pool(3, indexer, (engine, the_queue))
 
-    the_queue.close()
-    the_queue.join_thread()
-    the_pool.close()
-    the_pool.join()
+    workers: List[multiprocessing.Process] = []
+    for _ in range(4):
+        process = multiprocessing.Process(target=indexer, args=(engine, queue, updates))
+        process.start()
+        workers.append(process)
+
+    ui_worker = multiprocessing.Process(target=ui, args=(updates, repos))
+    ui_worker.start()
+
+    queue.join()
+    for process in workers:
+        process.join()
+    ui_worker.terminate()
 
     with Session(engine) as sess:
         cursor = sess.connection().connection.cursor()
@@ -83,11 +62,83 @@ def index_local_repos(engine: Engine):
         update repos set is_duplicate = true where repo in (select dup from exact_mirrors)
         """)
 
+def ui(updates: multiprocessing.JoinableQueue, repos: int):
+    with Progress(
+        "[progress.description]{task.description}",
+        BarColumn(),
+        MofNCompleteColumn(),
+    ) as progress:
+        skipped = 0
+        tasks = {
+            'parse': progress.add_task("Parse repo", total=repos),
+            'db': progress.add_task("Write to DB", total=repos),
+            'skipped': progress.add_task("Skipped/empty", total=None),
+        }
+        while True:
+            update = updates.get(block=True)
+            if update is None:
+                break
+            if update[0] == 'advance':
+                progress.advance(tasks[update[1]], 1)
+                if update[1] == 'skipped':
+                    skipped += 1
+                    progress.update(tasks['parse'], total=repos - skipped)
+                    progress.update(tasks['db'], total=repos - skipped)
+            else:
+                rich.print(update)
+            updates.task_done()
+
+
+def indexer(engine: Engine, queue: multiprocessing.JoinableQueue, updates: multiprocessing.Queue):
+    while True:
+        try:
+            repo = queue.get(block=False)
+        except Empty:
+            break
+
+        root = repo.settings['root']
+        try:
+            result = subprocess.Popen(
+                ['git', 'rev-parse', "HEAD"],
+                cwd=root, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            )
+            if result.stdout.readline() == b'HEAD\n':
+                updates.put(('advance', 'skipped'))
+                queue.task_done()
+                continue
+
+        except FileNotFoundError:
+            updates.put(('advance', 'skipped'))
+            queue.task_done()
+            continue
+
+        with Session(engine) as sess:
+            cursor = sess.connection().connection.cursor()
+            cursor.execute("CREATE TEMP TABLE git_files_tmp (LIKE git_files INCLUDING DEFAULTS) ON COMMIT DROP")
+            cursor.execute("CREATE TEMP TABLE git_commits_tmp (LIKE git_commits INCLUDING DEFAULTS) ON COMMIT DROP")
+            cursor.execute("CREATE TEMP TABLE git_commit_stats_tmp (LIKE git_commit_stats INCLUDING DEFAULTS) ON COMMIT DROP")
+
+            index_commits(cursor, repo)
+            index_current_files(cursor, repo)
+            updates.put(('advance', 'parse'))
+
+            cursor.execute("DELETE FROM git_files where repo_id in (select distinct repo_id from git_files_tmp limit 1)")
+            cursor.execute("with rows as (INSERT INTO git_files SELECT * FROM git_files_tmp ON CONFLICT DO NOTHING RETURNING 1) select count(*) from rows")
+            cursor.execute("DELETE FROM git_commits where repo_id = (select repo_id from git_commits_tmp limit 1)")
+            cursor.execute("with rows as (INSERT INTO git_commits SELECT * FROM git_commits_tmp ON CONFLICT DO NOTHING RETURNING 1) select count(*) from rows");
+            cursor.execute("DELETE FROM git_commit_stats where repo_id = (select repo_id from git_commit_stats_tmp limit 1)")
+            cursor.execute("with rows as (INSERT INTO git_commit_stats SELECT * FROM git_commit_stats_tmp ON CONFLICT DO NOTHING RETURNING 1) select count(*) from rows");
+
+            sess.commit()
+            updates.put(('advance', 'db'))
+
+        queue.task_done()
+
 
 def index_commits(cursor: DBAPICursor, repo: Repos):
     result = subprocess.Popen(
         ['git', 'log', "--pretty=format:|%H|%an|%ae|%at|%cn|%ce|%ct|%p|%s", '--numstat'],
-        cwd=repo.settings['root'], stdout=subprocess.PIPE,
+        cwd=repo.settings['root'], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
     )
     commits = []
     commit_stats = []
@@ -155,22 +206,24 @@ def index_commits(cursor: DBAPICursor, repo: Repos):
     cursor.copy_expert("COPY git_commit_stats_tmp (repo_id, commit_hash, file_path, additions, deletions) FROM STDIN (FORMAT CSV, delimiter E'\\t')", s_buf)
 
 
-def index_current_files(cursor: DBAPICursor, repo: Repos, gitrepo: git.Repo):
+def index_current_files(cursor: DBAPICursor, repo: Repos):
     files = []
 
-    # git ls-tree --full-name -rl HEAD
+    result = subprocess.Popen(
+        ['git', 'ls-tree', '-r', '--format=%(objectmode)|%(objecttype)|%(objectname)|%(objectsize)|%(path)', 'HEAD'],
+        cwd=repo.settings['root'], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+    )
+    for line in iter(lambda: result.stdout.readline(), b""):
+        line = line.decode('utf-8').encode('utf-8','ignore').decode("utf-8").strip()
+        x = line.split('|', maxsplit=5)
+        files.append([
+            repo.id,
+            x[4],
+            bool(int(x[0], 8) & 0o100),
+            pd.NA if x[3] == '-' else int(x[3]),
+            os.path.splitext(x[4])[1] or os.path.basename(x[4]),
+        ])
 
-    for f in gitrepo.head.commit.tree.list_traverse():
-        if f.type == 'blob':
-            path = str(f.path).encode('utf-8','ignore').decode("utf-8")
-            ext = os.path.splitext(path)[1] or os.path.basename(path)
-            files.append([
-                repo.id,
-                path,
-                f.file_mode & 0o100,
-                f.size,
-                ext,
-            ])
     df = pd.DataFrame(files, columns=[
         'repo_id',
         'path',
@@ -182,7 +235,6 @@ def index_current_files(cursor: DBAPICursor, repo: Repos, gitrepo: git.Repo):
     df.to_csv(s_buf, sep="\t", index=False, header=False, date_format='%Y-%m-%dT%H:%M:%S')
     s_buf.seek(0)
     cursor.copy_expert("COPY git_files_tmp (repo_id, path, executable, size, ext) FROM STDIN (FORMAT CSV, delimiter E'\\t')", s_buf)
-
 
 if __name__ == '__main__':
     with_env_and_engine(index_local_repos)
