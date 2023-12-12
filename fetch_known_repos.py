@@ -3,24 +3,28 @@
 from pathlib import Path
 import subprocess
 
-from sqlalchemy import select
-from sqlalchemy.orm import Session
+from dotenv import load_dotenv
+import duckdb
+from rich.progress import track
 
-from schema import Repos
-from utils import with_env_and_session
+def fetch_known_repos():
+    load_dotenv(override=False)
 
-def fetch_known_repos(sess: Session):
-    repos = sess.scalars(select(Repos)).all()
+    conn = duckdb.connect("git.duckdb")
+    with open('schema.sql') as f:
+        conn.sql(f.read())
 
-    for repo in repos:
-        root = Path(repo.settings['root'])
-        origin = repo.settings['origin']
+    repos = conn.sql("SELECT repos.repo, root || repo as root, origin || repo as origin FROM repos JOIN providers ON provider=providers.name").df()
+
+    for _, repo in track(list(repos.iterrows())):
+        root = Path(repo['root'])
+        origin = repo['origin']
 
         dir_path = root.parent
         dir_path.mkdir(parents=True, exist_ok=True)
 
         if root.is_dir():
-            print(f"Fetching {repo.repo}")
+            print(f"Fetching {repo.repo} in {root}")
 
             result = subprocess.Popen(["git", "fetch", "--prune"], cwd=root, stderr=subprocess.STDOUT, stdout=subprocess.PIPE)
             for line in iter(lambda: result.stdout.readline(), b""):
@@ -28,7 +32,7 @@ def fetch_known_repos(sess: Session):
             if result.wait() != 0:
                 print("Failed to fetch")
         else:
-            print(f"Cloning {repo.repo}")
+            print(f"Cloning {repo['repo']} from {origin} at {dir_path}")
 
             result = subprocess.Popen(["git", "clone", "--bare", origin], cwd=dir_path, stderr=subprocess.STDOUT, stdout=subprocess.PIPE)
             for line in iter(lambda: result.stdout.readline(), b""):
@@ -40,4 +44,4 @@ def fetch_known_repos(sess: Session):
 
 
 if __name__ == '__main__':
-    with_env_and_session(fetch_known_repos)
+    fetch_known_repos()

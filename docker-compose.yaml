@@ -9,47 +9,8 @@ services:
     volumes:
       - streamlit:/data/streamlit
       - ./:/app
-      - $GITLAB_ROOT:/repos-gitlab
-      - $GITOLITE_ROOT:/repos-gitolite
-      - ${SSH_AUTH_SOCK}:${SSH_AUTH_SOCK}
-      - ~/.ssh:/home/inuits/.ssh
-    depends_on:
-      - postgres
-      - migrate
-    environment:
-      - SQLALCHEMY_DATABASE_URL=postgresql://mergestat@postgres/mergestat
-      - GITLAB_ROOT=/repos-gitlab
-      - GITOLITE_ROOT=/repos-gitolite
-      - SSH_AUTH_SOCK
+      - ./data:/app/data
     env_file: .env
-
-  migrate:
-    build:
-      dockerfile: Dockerfile.migrate
-    command: graphile-migrate watch
-    environment:
-      - ROOT_DATABASE_URL=postgres://postgres@postgres/postgres
-      - DATABASE_URL=postgres://mergestat@postgres/mergestat
-      - SHADOW_DATABASE_URL=postgres://mergestat@postgres/mergestat-shadow
-    depends_on:
-      - postgres
-    volumes:
-      - ./:/app
-
-  postgres:
-    image: postgres
-    environment:
-      POSTGRES_USER: postgres
-      POSTGRES_DATABASE: postgres
-      POSTGRES_HOST_AUTH_METHOD: trust
-      PGDATA: /var/lib/postgresql/data/pgdata
-    volumes:
-      - ./schema/initdb.sh:/docker-entrypoint-initdb.d/initdb.sh
-      - postgres:/var/lib/postgresql/data/pgdata
-    ports:
-      - "5432:5432"
-    restart: unless-stopped
 
 volumes:
   streamlit:
-  postgres:

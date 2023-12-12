@@ -2,40 +2,43 @@
 
 import os
 import subprocess
+from dotenv import load_dotenv
 
-from sqlalchemy import select
-from sqlalchemy.orm import Session
-from sqlalchemy.dialects.postgresql import insert
-from schema import Providers, Repos
+import duckdb
+import pandas as pd
 
-from utils import with_env_and_session
+def discover_gitolite():
+    load_dotenv(override=False)
 
-def discover_gitolite(sess: Session):
-    provider = sess.scalar(select(Providers).where(Providers.name == "Gitolite"))
-    assert provider
-    settings = provider.settings
+    conn = duckdb.connect(":memory:")
+    with open('schema.sql') as f:
+        conn.sql(f.read())
+    if os.path.exists('data/providers.csv'):
+        conn.sql("COPY providers FROM 'data/providers.csv' WITH (HEADER 1, DELIMITER E'\\t')")
 
-    cmd_result = subprocess.run(
-        ['bash', '-c', f"ssh {settings['host']} 2>/dev/null | tail -n +3 | cut -b6-"],
+    host = os.environ["GITOLITE_HOST"]
+    conn.sql(
+        "INSERT OR IGNORE INTO providers (name, root, origin) values ($name, $root, $origin)",
+        params={
+            "name": "Gitolite",
+            'root': os.environ["GITOLITE_ROOT"],
+            'origin': f"ssh://{host}/",
+        },
+    )
+
+    repos = subprocess.run(
+        ['bash', '-c', f"ssh {host} 2>/dev/null | tail -n +3 | cut -b6-"],
         stdout=subprocess.PIPE
-    ).stdout.decode('utf-8')
-    repos = [f"{repo}.git" for repo in cmd_result.splitlines()]
+    ).stdout.decode('utf-8').splitlines()
 
-    stmt = insert(Repos).returning(Repos.repo).values([
-        {'repo': repo, 'provider': provider.id, 'settings': {
-            'root': os.path.join(settings['root'], repo),
-            'origin': os.path.join(settings['origin'], repo),
-        }}
-        for repo in repos
-    ])
-    stmt = stmt.on_conflict_do_nothing()
-    result = sess.execute(stmt).all()
+    df = pd.DataFrame({'repo': f"{repo}.git", 'provider': 'Gitolite'} for repo in repos)
+    res = conn.sql("INSERT INTO repos (repo, provider) SELECT repo, provider FROM df RETURNING 1").fetchall()
 
-    sess.commit()
+    print(f"Discovered {len(res)} repos from Gitolite")
 
-    print(f"Discovered {len(repos)} repos")
-    print(f"Inserted {len(result)} new repos")
+    conn.sql("COPY (FROM providers) TO 'data/providers.csv' WITH (HEADER 1, DELIMITER E'\\t')")
+    conn.sql("COPY (FROM repos) TO 'data/repos-gitolite.csv' WITH (HEADER 1, DELIMITER E'\\t')")
 
 
 if __name__ == '__main__':
-    with_env_and_session(discover_gitolite)
+    discover_gitolite()
