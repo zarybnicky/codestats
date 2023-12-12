@@ -75,10 +75,10 @@ def main():
         provider = None if selected.empty else selected.iloc[0]
 
         p_provider = provider['id'] if provider is not None and not provider.empty else None
-        p_repo = st.text_input('Repository (regex)', '') or ""
-        p_negrepo = st.text_input('Repository exclusion (regex)', 'mautic|matomo|imagemagick|osm2pgsql|simplesamle-php-upstream') or "^$"
-        p_author = st.text_input('Author name/email (regex)', '') or ""
-        p_negauthor = st.text_input('Author name/email exclusion (regex)', 'lctl.gov|immerda.ch|unige.ch|bastelfreak.de|kohlvanwijngaarden.nl') or "^$"
+        p_repo = st.text_input('Repository (regex)', '')
+        p_negrepo = st.text_input('Repository exclusion (regex)', 'mautic|matomo|imagemagick|osm2pgsql|simplesamle-php-upstream')
+        p_author = st.text_input('Author name/email (regex)', '')
+        p_negauthor = st.text_input('Author name/email exclusion (regex)', 'lctl.gov|immerda.ch|unige.ch|bastelfreak.de|kohlvanwijngaarden.nl')
         granularity = st.selectbox("Graph granularity", options=['year', 'month', 'week', 'day']) or 'week'
         time_range = conn.query("select date_trunc('month', min(author_when) - interval '15 day')::date as min, date_trunc('month', max(author_when) + interval '15 day')::date as max from git_commits", ttl=3600)
         time_range = pd.date_range(start=time_range['min'][0], end=time_range['max'][0], freq='MS')
@@ -129,8 +129,8 @@ def main():
         st.dataframe(authors, hide_index=True)
 
     with col3:
+        st.markdown("### Most active files")
         if st.checkbox("Calculate active files (slow)"):
-            st.markdown("### Most active files")
             active_files = conn.query(f"""
             WITH {filters.t_repos}, {filters.t_commits}
             SELECT commits, repo, file_path FROM (
@@ -159,7 +159,7 @@ def main():
     select date_trunc(:granularity, author_when) as author_when, sum(s.additions) as added, sum(s.deletions) as deleted
     from repos join git_commits on repo_id=repos.id join git_commit_stats s on hash=s.commit_hash
     WHERE {filters.commit_filter}
-    group by date_trunc(:granularity, author_when), provider
+    group by date_trunc(:granularity, author_when)
     order by author_when desc
     """, params=params, ttl=3600)
     per_period.set_index(keys=['author_when'], drop=True, inplace=True)
