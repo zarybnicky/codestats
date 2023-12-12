@@ -1,39 +1,73 @@
 #!/usr/bin/env python3
 
+import datetime
 import os
 import os.path
+from typing import NamedTuple
 
 import altair as alt
-import git
-import git.exc
 import humanize
+from sqlalchemy import text
 import streamlit as st
 import pandas as pd
 from streamlit.connections import SQLConnection
 
-st.set_page_config(layout="wide")
-conn: SQLConnection = st.connection("sql", url=os.environ["SQLALCHEMY_DATABASE_URL"])
 
+class Filters(NamedTuple):
+    provider: str | None
+    pos_repo: str | None
+    neg_repo: str | None
+    pos_author: str | None
+    neg_author: str | None
+    granularity: str
+    time_from: datetime.datetime
+    time_to: datetime.datetime
 
-def select_repo(conn, provider) -> str | None:
-    df = conn.query("select id, repo, settings->>'root' as root from repos where provider = :id", params={'id': provider['id']}, ttl=3600)
-    st.write(f"Total: {len(df)} repos")
+    @property
+    def t_repos(self):
+        return f"""
+        t_repos as (
+          SELECT repos.* FROM repos
+          WHERE NOT is_duplicate
+          AND {"provider = :provider" if self.provider else "TRUE"}
+          AND {"repo ~* :pos_repo" if self.pos_repo else "TRUE"}
+          AND {"repo !~* :neg_repo" if self.neg_repo else "TRUE"}
+        )
+        """
+    @property
+    def t_commits(self):
+        return f"""
+        t_commits as (
+          SELECT git_commits.*
+          FROM git_commits JOIN t_repos on t_repos.id=repo_id
+          WHERE author_when BETWEEN :time_from AND date_trunc('month', :time_to + INTERVAL '31 day')
+          AND {"(author_name ~* :pos_author OR author_email ~* :pos_author)" if self.pos_author else "TRUE"}
+          AND {"(author_name !~* :neg_author AND author_email !~* :neg_author)" if self.neg_author else "TRUE"}
+        )
+        """
 
-    repo_ix = st.selectbox("Repo", options=df.index, format_func=lambda x: df.loc[x]['repo'])
-    repo_object = df.loc[repo_ix]
+    @property
+    def repo_filter(self):
+        return f"""
+        NOT is_duplicate
+        AND {"provider = :provider" if self.provider else "TRUE"}
+        AND {"repo ~* :pos_repo" if self.pos_repo else "TRUE"}
+        AND {"repo !~* :neg_repo" if self.neg_repo else "TRUE"}
+        """
 
-    try:
-        repo = git.Repo(repo_object['root'])
-        _ = repo.head.commit
-    except git.exc.NoSuchPathError:
-        st.write("No local repo")
-        return
-    except ValueError:
-        st.write("Local repo is empty")
-        return
-
+    @property
+    def commit_filter(self):
+        return f"""
+        {self.repo_filter}
+        AND {"(author_name ~* :pos_author OR author_email ~* :pos_author)" if self.pos_author else "TRUE"}
+        AND {"(author_name !~* :neg_author AND author_email !~* :neg_author)" if self.neg_author else "TRUE"}
+        and author_when between :time_from and date_trunc('month', :time_to + interval '31 day')
+        """
 
 def main():
+    st.set_page_config(layout="wide")
+    conn: SQLConnection = st.connection("sql", url=os.environ["SQLALCHEMY_DATABASE_URL"], echo=True)
+
     with st.sidebar:
         providers = conn.query('select id, name, settings from mergestat.providers', ttl=3600)
         provider_name = st.selectbox("Forge", options=providers['name'], index=None)
@@ -54,85 +88,79 @@ def main():
             value=(time_range[0], time_range[-1]),
             format_func=lambda x: str(x)[0:7]
         )
-        basic_filter = """
-        where not is_duplicate
-        and case when :id is null then true else provider = :id end
-        and repo ~* :p_repo and repo !~* :p_negrepo
-        and (author_name ~* :p_author or author_email ~* :p_author)
-        and (author_name !~* :p_negauthor and author_email !~* :p_negauthor)
-        and author_when between :from and date_trunc('month', :to + interval '31 day')
-        """
-        params = {
-            'id': p_provider,
-            'p_repo': p_repo,
-            'p_negrepo': p_negrepo,
-            'p_author': p_author,
-            'p_negauthor': p_negauthor,
-            'from': time_range[0],
-            'to': time_range[1],
-            'granularity': granularity,
-        }
+
+    filters = Filters(
+        provider=p_provider,
+        pos_repo=p_repo,
+        neg_repo=p_negrepo,
+        pos_author=p_author,
+        neg_author=p_negauthor,
+        time_from=time_range[0],
+        time_to=time_range[1],
+        granularity=granularity,
+    )
+    params = filters._asdict()
 
     st.markdown("### Last commit activity")
-    last_active = conn.query(f"""
-    select repo, message, author_when, author_name, author_email
-    from repos join git_commits on repo_id=repos.id
-    {basic_filter} order by author_when desc limit 100
+    last_commits = conn.query(f"""
+    SELECT repo, message, author_when, author_name, author_email
+    FROM git_commits JOIN repos ON git_commits.repo_id=repos.id
+    WHERE {filters.commit_filter} ORDER BY author_when DESC LIMIT 100
     """, params=params, ttl=3600)
-    last_active.set_index(keys=['author_when'], drop=True, inplace=True)
-    st.write(last_active)
+    st.dataframe(last_commits, hide_index=True)
 
     col1, col2, col3 = st.columns([3, 2, 4])
     with col1:
         st.markdown("### Most active repositories")
         most_active = conn.query(f"""
-        select repos.repo, count(*) as commits
+        select repo, count(*) as commits
         from repos join git_commits on repo_id=repos.id
-        {basic_filter} group by repos.repo order by count(hash) desc limit 100
+        WHERE {filters.commit_filter} group by repo order by count(hash) desc limit 100
         """, params=params, ttl=3600)
         st.dataframe(most_active, hide_index=True)
+
     with col2:
         st.markdown("### Most active authors")
         authors = conn.query(f"""
         select author_email, count(*) as commits
         from repos join git_commits on repo_id=repos.id
-        {basic_filter} group by author_email order by count(hash) desc limit 100
+        WHERE {filters.commit_filter} group by author_email order by count(hash) desc limit 100
         """, params=params, ttl=3600)
         st.dataframe(authors, hide_index=True)
-    with col3:
-        st.markdown("### Most active files")
-        files = conn.query(f"""
-        with t_repos as (
-          select repos.* from repos join mergestat.providers on provider=providers.id
-          where not is_duplicate
-          and case when :id is null then true else provider = :id end
-          and repo ~* :p_repo and repo !~* :p_negrepo
-        ), t_commits as (
-          select git_commits.* from git_commits join t_repos on t_repos.id=repo_id
-          where (author_name ~* :p_author or author_email ~* :p_author)
-          and (author_name !~* :p_negauthor and author_email !~* :p_negauthor)
-          and author_when between :from and date_trunc('month', :to + interval '31 day')
-        )
-        select count(*) as commits, repo, file_path
-        from git_commit_stats s join t_commits on s.commit_hash=hash join t_repos on t_commits.repo_id=t_repos.id
-        group by s.file_path, repo order by count(*) desc limit 100
-        """, params=params, ttl=3600)
-        st.dataframe(files, hide_index=True)
 
-    st.markdown("### Commit count timeline")
+    with col3:
+        if st.checkbox("Calculate active files (slow)"):
+            st.markdown("### Most active files")
+            active_files = conn.query(f"""
+            WITH {filters.t_repos}, {filters.t_commits}
+            SELECT commits, repo, file_path FROM (
+              SELECT COUNT(*) AS commits, s.repo_id, file_path
+              FROM git_commit_stats s JOIN t_commits ON s.commit_hash=hash
+              GROUP BY s.repo_id, s.file_path
+              ORDER BY commits DESC LIMIT 100
+            ) JOIN repos ON repo_id=repos.id
+            """, params=params, ttl=3600)
+            st.dataframe(active_files)
+
     per_period = conn.query(f"""
     select date_trunc(:granularity, author_when) as author_when, providers.name as provider, count(*)
     from repos join git_commits on repo_id=repos.id join mergestat.providers on provider=providers.id
-    {basic_filter} group by date_trunc(:granularity, author_when), providers.name order by author_when desc, providers.name desc
+    WHERE {filters.commit_filter}
+    group by date_trunc(:granularity, author_when), providers.name
+    order by author_when desc, providers.name desc
     """, params=params, ttl=3600)
     per_period.set_index(keys=['author_when'], drop=True, inplace=True)
+    
+    st.markdown("### Commit count timeline")
     st.bar_chart(per_period, color='provider', y='count')
 
     st.markdown("### Lines added/removed timeline")
     per_period = conn.query(f"""
     select date_trunc(:granularity, author_when) as author_when, sum(s.additions) as added, sum(s.deletions) as deleted
     from repos join git_commits on repo_id=repos.id join git_commit_stats s on hash=s.commit_hash
-    {basic_filter} group by date_trunc(:granularity, author_when), provider order by author_when desc
+    WHERE {filters.commit_filter}
+    group by date_trunc(:granularity, author_when), provider
+    order by author_when desc
     """, params=params, ttl=3600)
     per_period.set_index(keys=['author_when'], drop=True, inplace=True)
     st.bar_chart(per_period, y=['added', 'deleted'])
@@ -141,7 +169,7 @@ def main():
     per_period = conn.query(f"""
     select date_trunc('day', author_when) as date, count(*) as count
     from repos join git_commits on repo_id=repos.id
-    {basic_filter} group by date_trunc('day', author_when) order by date desc
+    WHERE {filters.commit_filter} group by date_trunc('day', author_when) order by date desc
     """, params=params, ttl=3600)
     per_period.set_index(keys=['date'], drop=False, inplace=True)
 
@@ -180,7 +208,7 @@ def main():
     select max(date_trunc('day', author_when)) as last_touched, repo, count(*) as commits, max(files) as files
     from repos join git_commits on repo_id=repos.id
     left join lateral (select repo_id, count(*) as files from git_files group by repo_id) t on t.repo_id=repos.id
-    {basic_filter} group by repo order by last_touched desc
+    WHERE {filters.commit_filter} group by repo order by last_touched desc
     """, params=params, ttl=3600)
     c = alt.Chart(old_repos).mark_point().encode(
         alt.X('last_touched:T'),
@@ -193,7 +221,7 @@ def main():
     st.markdown("### Technologies")
     most_active = conn.query(f"""
     with techs as (
-    select repo_id, path, ext, size, case ext
+    select git_files.*, case ext
     when 'Dockerfile' then 'Docker'
     when '.js' then 'JavaScript'
     when '.ts' then 'TypeScript'
@@ -246,7 +274,8 @@ def main():
     when '.gitignore' then null
     when 'LICENSE' then null
     else null end as tech
-    from git_files
+    FROM git_files LEFT JOIN repos ON repo_id=repos.id
+    WHERE {filters.repo_filter}
     ) select tech, sum(size) as bytes,
       (select repo from repos where id=(array_agg(repo_id order by size desc))[1]) as biggest_repo,
       (array_agg(size order by size desc))[1] as biggest_size,
@@ -269,14 +298,13 @@ def main():
         )
         st.altair_chart(c)
 
-    most_active = conn.query("""
+    most_active = conn.query(f"""
     select ext as tech, sum(size) as bytes,
       (select repo from repos where id=(array_agg(repo_id order by size desc))[1]) as biggest_repo,
       (array_agg(size order by size desc))[1] as biggest_size,
       (array_agg(path order by size desc))[1] as biggest_path
-    from git_files
-    group by ext
-    order by bytes desc limit 20
+    FROM git_files LEFT JOIN repos ON repo_id=repos.id
+    WHERE {filters.repo_filter} group by ext order by bytes desc limit 20
     """, params=params, ttl=3600)
     most_active['human_bytes'] = most_active['bytes'].apply(humanize.naturalsize)
     most_active['biggest_size'] = most_active['biggest_size'].apply(humanize.naturalsize)
@@ -288,6 +316,29 @@ def main():
             tooltip=['human_bytes', 'tech', 'biggest_size', 'biggest_repo', 'biggest_path'],
         )
         st.altair_chart(c)
+
+    largest_files = conn.query(f"""
+    select repo, path, size, t.*
+    FROM git_files JOIN repos ON repo_id=repos.id
+    LEFT JOIN LATERAL
+      (SELECT author_when, author_name, author_email
+        FROM git_commit_stats
+        JOIN git_commits on hash=commit_hash
+        WHERE git_commit_stats.repo_id=repos.id AND file_path=path
+        ORDER BY author_when LIMIT 1
+      ) t on true
+    WHERE {filters.repo_filter} ORDER BY size DESC LIMIT 20
+    """, params=params, ttl=3600)
+    largest_files['size'] = largest_files['size'].apply(humanize.naturalsize)
+    st.dataframe(largest_files, hide_index=True)
+
+    largest_repos = conn.query(f"""
+    select repo, sum(size) as size
+    FROM git_files JOIN repos ON repo_id=repos.id
+    WHERE {filters.repo_filter} GROUP BY repo ORDER BY SUM(size) DESC LIMIT 20
+    """, params=params, ttl=3600)
+    largest_repos['size'] = largest_repos['size'].apply(humanize.naturalsize)
+    st.dataframe(largest_repos, hide_index=True)
 
 
 def sizeof_fmt(num, suffix="B"):

@@ -3,64 +3,88 @@
 from io import StringIO
 import os
 import subprocess
+import multiprocessing
 import pandas as pd
 import git
 import git.exc
-from sqlalchemy import select, text
+from sqlalchemy import Engine, select, text
 from sqlalchemy.engine.interfaces import DBAPICursor
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, scoped_session, sessionmaker
 from schema import Repos
 
-from utils import with_env_and_session
+from utils import with_env_and_engine
 
 
-def index_local_repos(sess: Session):
-    repos = sess.scalars(select(Repos)).all()
+def indexer(engine: Engine, queue: multiprocessing.Queue):
+    while True:
+        repo = queue.get(block=True)
+        if repo is None:
+            break
+        with Session(engine) as sess:
+            sess.execute(text("CREATE TEMP TABLE git_files_tmp (LIKE git_files INCLUDING DEFAULTS) on commit drop"))
+            sess.execute(text("CREATE TEMP TABLE git_commits_tmp (LIKE git_commits INCLUDING DEFAULTS) on commit drop"))
+            sess.execute(text("CREATE TEMP TABLE git_commit_stats_tmp (LIKE git_commit_stats INCLUDING DEFAULTS) on commit drop"))
+            cursor = sess.connection().connection.cursor()
 
-    sess.execute(text("CREATE TEMP TABLE git_files_tmp (LIKE git_files INCLUDING DEFAULTS) on commit drop"))
-    sess.execute(text("CREATE TEMP TABLE git_commits_tmp (LIKE git_commits INCLUDING DEFAULTS) on commit drop"))
-    sess.execute(text("CREATE TEMP TABLE git_commit_stats_tmp (LIKE git_commit_stats INCLUDING DEFAULTS) on commit drop"))
-    cursor = sess.connection().connection.cursor()
+            root = repo.settings['root']
+            print(f"{root}")
+            try:
+                gitrepo = git.Repo(root)
+                _ = gitrepo.head.commit
+            except git.exc.NoSuchPathError:
+                continue
+            except ValueError:
+                continue
 
-    for i, repo in enumerate(repos):
-        root = repo.settings['root']
-        print(f"[{i}/{len(repos)}]: {root}")
-        try:
-            gitrepo = git.Repo(root)
-            _ = gitrepo.head.commit
-        except git.exc.NoSuchPathError:
-            continue
-        except ValueError:
-            continue
+            index_commits(cursor, repo)
+            index_current_files(cursor, repo, gitrepo)
 
-        index_commits(cursor, repo, gitrepo)
-        index_current_files(cursor, repo, gitrepo)
+            cursor.execute("DELETE FROM git_files where repo_id in (select distinct repo_id from git_files_tmp limit 1)")
+            cursor.execute("with rows as (INSERT INTO git_files SELECT * FROM git_files_tmp ON CONFLICT DO NOTHING RETURNING 1) select count(*) from rows")
+            cursor.execute("DELETE FROM git_commits where repo_id = (select repo_id from git_commits_tmp limit 1)")
+            cursor.execute("with rows as (INSERT INTO git_commits SELECT * FROM git_commits_tmp ON CONFLICT DO NOTHING RETURNING 1) select count(*) from rows");
+            cursor.execute("DELETE FROM git_commit_stats where repo_id = (select repo_id from git_commit_stats_tmp limit 1)")
+            cursor.execute("with rows as (INSERT INTO git_commit_stats SELECT * FROM git_commit_stats_tmp ON CONFLICT DO NOTHING RETURNING 1) select count(*) from rows");
 
-    cursor.execute("DELETE FROM git_files where repo_id in (select distinct repo_id from git_files_tmp limit 1)")
-    cursor.execute("with rows as (INSERT INTO git_files SELECT * FROM git_files_tmp ON CONFLICT DO NOTHING RETURNING 1) select count(*) from rows")
-    cursor.execute("DELETE FROM git_commits where repo_id = (select repo_id from git_commits_tmp limit 1)")
-    cursor.execute("with rows as (INSERT INTO git_commits SELECT * FROM git_commits_tmp ON CONFLICT DO NOTHING RETURNING 1) select count(*) from rows");
-    cursor.execute("DELETE FROM git_commit_stats where repo_id = (select repo_id from git_commit_stats_tmp limit 1)")
-    cursor.execute("with rows as (INSERT INTO git_commit_stats SELECT * FROM git_commit_stats_tmp ON CONFLICT DO NOTHING RETURNING 1) select count(*) from rows");
-
-    cursor.execute("""
-    with exact_mirrors as (
-      select unnest((array_agg(repo))[2:]) as dup
-      from repos
-      left join lateral (select hash as first_rev from git_commits where repo_id=repos.id and parents=0) t2 on true
-      left join lateral (select count(*) as commit_count from git_commits where repo_id=repos.id) t1 on true
-      group by first_rev, commit_count
-      having count(first_rev) > 1
-    ), reverted as (
-      update repos set is_duplicate = false
-    )
-    update repos set is_duplicate = true where repo in (select dup from exact_mirrors)
-    """)
-
-    sess.commit()
+            sess.commit()
 
 
-def index_commits(cursor: DBAPICursor, repo: Repos, gitrepo: git.Repo):
+def index_local_repos(engine: Engine):
+    the_queue = multiprocessing.Queue()
+
+    with Session(engine) as sess:
+        repos = sess.scalars(select(Repos)).all()
+        for repo in repos:
+            _ = repo.id
+            _ = repo.settings
+            the_queue.put(repo)
+
+    engine.dispose()
+    the_pool = multiprocessing.Pool(3, indexer, (engine, the_queue))
+
+    the_queue.close()
+    the_queue.join_thread()
+    the_pool.close()
+    the_pool.join()
+
+    with Session(engine) as sess:
+        cursor = sess.connection().connection.cursor()
+        cursor.execute("""
+        with exact_mirrors as (
+          select unnest((array_agg(repo))[2:]) as dup
+          from repos
+          left join lateral (select hash as first_rev from git_commits where repo_id=repos.id and parents=0) t2 on true
+          left join lateral (select count(*) as commit_count from git_commits where repo_id=repos.id) t1 on true
+          group by first_rev, commit_count
+          having count(first_rev) > 1
+        ), reverted as (
+          update repos set is_duplicate = false
+        )
+        update repos set is_duplicate = true where repo in (select dup from exact_mirrors)
+        """)
+
+
+def index_commits(cursor: DBAPICursor, repo: Repos):
     result = subprocess.Popen(
         ['git', 'log', "--pretty=format:|%H|%an|%ae|%at|%cn|%ce|%ct|%p|%s", '--numstat'],
         cwd=repo.settings['root'], stdout=subprocess.PIPE,
@@ -133,6 +157,9 @@ def index_commits(cursor: DBAPICursor, repo: Repos, gitrepo: git.Repo):
 
 def index_current_files(cursor: DBAPICursor, repo: Repos, gitrepo: git.Repo):
     files = []
+
+    # git ls-tree --full-name -rl HEAD
+
     for f in gitrepo.head.commit.tree.list_traverse():
         if f.type == 'blob':
             path = str(f.path).encode('utf-8','ignore').decode("utf-8")
@@ -158,4 +185,4 @@ def index_current_files(cursor: DBAPICursor, repo: Repos, gitrepo: git.Repo):
 
 
 if __name__ == '__main__':
-    with_env_and_session(index_local_repos)
+    with_env_and_engine(index_local_repos)
