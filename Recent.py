@@ -20,7 +20,7 @@ def main():
 
     last_projects = conn.sql(f"""
     WITH maxdate AS (
-      select (date_trunc('day', max(author_when)) - interval '3 day')::date as maxdate
+      select (date_trunc('day', max(author_when)) - interval '7 day')::date as maxdate
       from git_commits JOIN repos ON git_commits.repo_id=repos.id
       WHERE {filters.commit_filter}
     )
@@ -31,7 +31,7 @@ def main():
     GROUP BY repo
     ORDER BY count(hash) DESC LIMIT 100
     """, params=filters.commit_params).df()
-    st.markdown("### Most active in last 3 days")
+    st.markdown("### Most active in last 7 days")
     st.dataframe(last_projects, hide_index=True)
 
 if __name__ == '__main__':
