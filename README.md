@@ -8,13 +8,17 @@
    mv ~/Downloads/git.duckdb.gz data/
    gunzip data/git.duckdb.gz
    ```
-2. Install dependencies
+2. Install dependencies and start Streamlit
    ```sh
    poetry install
-   ```
-3. Start Streamlit
-   ```sh
    poetry run streamlit run Recent.py
+   ```
+   
+   *OR* if you don't want to install Python, there's a `Dockerfile` and/or a `docker-compose.yml` too, although it seems to run somewhat slower, perhaps due to the default cgroups limits? DuckDB seems rather hungry for resources.
+   
+   ```sh
+   docker compose build
+   docker compose up
    ```
 
 ## Without an existing DB
