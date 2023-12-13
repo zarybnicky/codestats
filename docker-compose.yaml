@@ -7,10 +7,6 @@ services:
     ports:
       - "8501:8501"
     volumes:
-      - streamlit:/data/streamlit
       - ./:/app
       - ./data:/app/data
     env_file: .env
-
-volumes:
-  streamlit:

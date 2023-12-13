@@ -24,4 +24,4 @@ WORKDIR /app
 
 COPY . .
 
-CMD python -m streamlit run main.py
+CMD python -m streamlit run Recent.py
