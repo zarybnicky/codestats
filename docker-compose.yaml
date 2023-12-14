@@ -2,11 +2,9 @@ version: '3.5'
 
 services:
   streamlit:
-    build:
-      dockerfile: Dockerfile
+    image: zarybnicky/codestats
     ports:
       - "8501:8501"
     volumes:
       - ./:/app
       - ./data:/app/data
-    env_file: .env

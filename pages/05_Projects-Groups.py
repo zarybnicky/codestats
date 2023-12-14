@@ -19,6 +19,7 @@ def main():
       IF(repo ilike '%mediamosa%' or repo ilike '%mediasalsa%', 'mediamosa', NULL),
       IF(repo ilike '%-dams%', 'dams', NULL),
       IF(repo ilike '%cinvio%', 'cinvio', NULL),
+      IF(repo ilike '%sportoase%', 'sportoase', NULL),
       IF(repo ilike '%sqs%', 'sqs', NULL),
       IF(repo ilike '%digitrans%', 'digitrans', NULL),
       IF(repo ilike '%jenkins%', 'jenkins', NULL),
