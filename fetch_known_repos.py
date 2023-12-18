@@ -10,10 +10,12 @@ from rich.progress import track
 def fetch_known_repos():
     load_dotenv(override=False)
 
-    conn = duckdb.connect("git.duckdb")
+    conn = duckdb.connect(":memory:")
     with open('schema.sql') as f:
         conn.sql(f.read())
 
+    conn.sql("COPY providers FROM 'data/providers.csv' WITH (HEADER 1, DELIMITER E'\\t')")
+    conn.sql("COPY repos FROM 'data/repos*.csv' WITH (HEADER 1, DELIMITER E'\\t')")
     repos = conn.sql("SELECT repos.repo, root || repo as root, origin || repo as origin FROM repos JOIN providers ON provider=providers.name").df()
 
     for _, repo in track(list(repos.iterrows())):

@@ -52,10 +52,10 @@ def main():
     with colored as (
       select repos.*, unnest(list_distinct({colors})) as color from repos where {filters.repo_filter}
     )
-    SELECT repo FROM repos
-    WHERE {filters.repo_filter} AND id not in (SELECT id FROM colored)
-    group by repo ORDER BY repo DESC LIMIT 500
-    """, params=filters.repo_params).df()
+    SELECT repo, count(*) as count FROM repos join git_commits on repo_id=repos.id
+    WHERE {filters.commit_filter} AND id not in (SELECT id FROM colored)
+    group by repo ORDER BY count(*) DESC LIMIT 500
+    """, params=filters.commit_params).df()
     st.markdown(f"### Uncategorized")
     st.dataframe(last_commits, hide_index=True, use_container_width=True)
 
