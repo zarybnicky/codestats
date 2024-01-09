@@ -83,8 +83,8 @@ def main():
     """, params=filters.commit_params).df()
     c = alt.Chart(old_repos).mark_point().encode(
         alt.X('last_touched:T'),
-        alt.Y('commits:Q'),
-        size='files:Q',
+        alt.Y('commits:Q').scale(type='log'),
+        size=alt.Size('files:Q').scale(type='log'),
         tooltip=['repo:N', 'commits:Q', 'files:Q', 'last_touched:T'],
     )
     st.altair_chart(c, use_container_width=True)
